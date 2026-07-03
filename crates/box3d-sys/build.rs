@@ -34,7 +34,10 @@ fn main() {
     let max_worlds = std::env::var("BOX3D_MAX_WORLDS").unwrap_or_else(|_| "1024".into());
     build.define("B3_MAX_WORLDS", max_worlds.as_str());
 
-    if std::env::var("CARGO_FEATURE_SIMD").is_ok() {
+    // Env escape hatch: features are additive and the wrapper enables our
+    // defaults, so scalar can only be forced from outside the feature system.
+    let force_scalar = std::env::var("BOX3D_FORCE_SCALAR").is_ok_and(|v| v != "0");
+    if std::env::var("CARGO_FEATURE_SIMD").is_ok() && !force_scalar {
         // Reach core.h's B3_CPU_WASM branch (only used in its SIMD cascade) and
         // satisfy <emmintrin.h> with emscripten's SSE2->wasm128 compat headers.
         build
@@ -60,4 +63,5 @@ fn main() {
     println!("cargo:rerun-if-changed=shims");
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-env-changed=BOX3D_MAX_WORLDS");
+    println!("cargo:rerun-if-env-changed=BOX3D_FORCE_SCALAR");
 }

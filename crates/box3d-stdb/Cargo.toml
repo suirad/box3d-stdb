@@ -18,3 +18,5 @@ box3d = "0.1.14"
 # Deliberately direct (wrapper already pulls sys): feature forwarding requires
 # it, and the glue layer needs raw FFI (step events, internal APIs).
 box3d-sys = "0.1.14"
+# The `log` facade — SpacetimeDB modules install a logger, so this reaches the module log.
+log = "0.4"

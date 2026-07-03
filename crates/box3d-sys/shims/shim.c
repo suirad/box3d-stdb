@@ -3,6 +3,12 @@
 #include <stddef.h>
 #include <stdarg.h>
 
+// Real string formatting so b3Log messages (formatted via vsnprintf in
+// core.c:b3Log BEFORE reaching the log callback) survive to the module log.
+// Formatting lives in Rust (src/stdb.rs, core::fmt) — on wasm32 a va_list is
+// just a pointer into an aligned arg buffer, so it forwards as void*.
+int b3stdb_vsnprintf(char* buf, size_t n, const char* fmt, void* args);
+
 // --- string ---
 
 char* strncpy(char* dst, const char* src, size_t n)
@@ -103,19 +109,16 @@ int vfprintf(FILE* f, const char* fmt, va_list ap)
 
 int vsnprintf(char* buf, size_t n, const char* fmt, va_list ap)
 {
-	(void)fmt;
-	(void)ap;
-	if (buf && n > 0)
-		buf[0] = 0;
-	return 0;
+	return b3stdb_vsnprintf(buf, n, fmt, (void*)ap);
 }
 
 int snprintf(char* buf, size_t n, const char* fmt, ...)
 {
-	(void)fmt;
-	if (buf && n > 0)
-		buf[0] = 0;
-	return 0;
+	va_list ap;
+	va_start(ap, fmt);
+	int r = b3stdb_vsnprintf(buf, n, fmt, (void*)ap);
+	va_end(ap);
+	return r;
 }
 
 int puts(const char* s)

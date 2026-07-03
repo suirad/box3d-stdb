@@ -8,6 +8,11 @@ license = "MIT"
 description = "Raw Rust FFI bindings for Box3D, built for SpacetimeDB wasm modules"
 
 [features]
+# wasm SIMD128 via emscripten's SSE2 compat headers (shims/include/wasm-sse2).
+# Default on: measured ~1.7x faster on contact-heavy scenes with bit-identical
+# results vs scalar. Opt out with BOX3D_FORCE_SCALAR=1 (a feature can't do it —
+# the box3d wrapper enables our defaults unconditionally).
+default = ["simd"]
 simd = []
 
 [dependencies]
