@@ -1,0 +1,3 @@
+# These crates are wasm-only (SpacetimeDB modules).
+[build]
+target = "wasm32-unknown-unknown"

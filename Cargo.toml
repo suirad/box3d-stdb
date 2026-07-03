@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/box3d-sys", "crates/box3d-stdb"]
+resolver = "2"
+
+# In-repo builds resolve the box3d wrapper's box3d-sys dep to ours.
+# Consumers repeat this stanza with git = "<this repo>" in their root manifest.
+[patch.crates-io]
+box3d-sys = { path = "crates/box3d-sys" }

@@ -1,0 +1,20 @@
+[package]
+name = "box3d-stdb"
+# Tracks the box3d wrapper version it re-exports.
+version = "0.1.14"
+edition = "2021"
+license = "MIT"
+description = "SpacetimeDB integration for box3d: re-exports the box3d wrapper API"
+
+[lib]
+# cdylib is the link gate — building this must produce a fully-linked .wasm.
+crate-type = ["rlib", "cdylib"]
+
+[features]
+simd = ["box3d-sys/simd"]
+
+[dependencies]
+box3d = "0.1.14"
+# Deliberately direct (wrapper already pulls sys): feature forwarding requires
+# it, and the glue layer needs raw FFI (step events, internal APIs).
+box3d-sys = "0.1.14"

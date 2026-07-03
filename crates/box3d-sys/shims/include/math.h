@@ -1,0 +1,30 @@
+#pragma once
+
+// sqrtf/floorf/ceilf/fabsf/fminf/fmaxf lower to native wasm ops; the rest are
+// exported from Rust's libm (src/stdb.rs).
+float sinf(float);
+float cosf(float);
+float tanf(float);
+float asinf(float);
+float acosf(float);
+float atanf(float);
+float atan2f(float, float);
+float sqrtf(float);
+float floorf(float);
+float ceilf(float);
+float fabsf(float);
+float fmodf(float, float);
+float remainderf(float, float);
+float powf(float, float);
+float expf(float);
+float logf(float);
+float fminf(float, float);
+float fmaxf(float, float);
+
+#define isinf(x) __builtin_isinf(x)
+#define isnan(x) __builtin_isnan(x)
+#define isfinite(x) __builtin_isfinite(x)
+
+#define INFINITY (__builtin_inff())
+#define NAN (__builtin_nanf(""))
+#define FLT_EPSILON __FLT_EPSILON__

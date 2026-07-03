@@ -1,0 +1,17 @@
+# This package replaces crates.io box3d-sys via [patch.crates-io]; name/version/links must track upstream.
+[package]
+name = "box3d-sys"
+version = "0.1.14"
+edition = "2021"
+links = "box3d"
+license = "MIT"
+description = "Raw Rust FFI bindings for Box3D, built for SpacetimeDB wasm modules"
+
+[features]
+simd = []
+
+[dependencies]
+libm = "0.2"
+
+[build-dependencies]
+cc = "1"
