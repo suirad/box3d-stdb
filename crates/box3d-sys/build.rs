@@ -13,7 +13,9 @@ fn main() {
     let src = PathBuf::from("../../vendor/box3d/src");
     let mut build = cc::Build::new();
 
-    for entry in std::fs::read_dir(&src).expect("box3d submodule missing — run: git submodule update --init") {
+    for entry in
+        std::fs::read_dir(&src).expect("box3d submodule missing — run: git submodule update --init")
+    {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|e| e == "c") {
             build.file(&path);
@@ -55,7 +57,10 @@ fn main() {
 
     // Wasm-only crate: bare wasm32-unknown-unknown has no libc headers; always
     // use our minimal shim set.
-    build.flag("-isystem").flag("shims/include").flag("-ffreestanding");
+    build
+        .flag("-isystem")
+        .flag("shims/include")
+        .flag("-ffreestanding");
 
     build.compile("box3d");
     println!("cargo:rerun-if-changed=../../vendor/box3d/src");

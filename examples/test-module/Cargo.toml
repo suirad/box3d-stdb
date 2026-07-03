@@ -1,6 +1,6 @@
-# Consumer example + runtime verification harness for box3d-stdb.
+# Runtime verification harness for box3d-stdb.
 [package]
-name = "box3d-demo"
+name = "box3d-test"
 version = "0.1.0"
 edition = "2021"
 

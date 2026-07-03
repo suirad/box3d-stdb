@@ -80,6 +80,7 @@ dependencies = [
  "box3d",
  "box3d-stdb",
  "box3d-sys",
+ "log",
  "spacetimedb",
 ]
 
@@ -90,6 +91,7 @@ dependencies = [
  "box3d",
  "box3d-sys",
  "log",
+ "spacetimedb",
 ]
 
 [[package]]

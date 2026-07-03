@@ -14,6 +14,7 @@ crate-type = ["rlib", "cdylib"]
 simd = ["box3d-sys/simd"]
 
 [dependencies]
+spacetimedb = "2.6"
 box3d = "0.1.14"
 # Deliberately direct (wrapper already pulls sys): feature forwarding requires
 # it, and the glue layer needs raw FFI (step events, internal APIs).

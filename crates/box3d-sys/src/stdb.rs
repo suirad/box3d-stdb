@@ -162,7 +162,11 @@ pub unsafe extern "C" fn b3stdb_vsnprintf(
 ) -> i32 {
     use core::fmt::Write;
 
-    let mut out = CBuf { ptr: buf, cap: n, len: 0 };
+    let mut out = CBuf {
+        ptr: buf,
+        cap: n,
+        len: 0,
+    };
     let mut ap = VaArgs(args as *const u8);
     let f = core::ffi::CStr::from_ptr(fmt).to_bytes();
 

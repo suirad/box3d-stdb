@@ -92,6 +92,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "box3d-test"
+version = "0.1.0"
+dependencies = [
+ "box3d",
+ "box3d-stdb",
+ "box3d-sys",
+ "log",
+ "spacetimedb",
+]
+
+[[package]]
 name = "bytemuck"
 version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
