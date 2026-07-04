@@ -1,6 +1,8 @@
 //! Drops a sphere, steps the world, records where it lands.
 
-use box3d::{BodyDef, ShapeDef, Vec3, World};
+use box3d::{BodyDef, Quat, ShapeDef, Vec3, World};
+// Brings the `.b3_body()` accessor into scope; the mirror table lives in box3d-stdb.
+use box3d_stdb::b3_body;
 use spacetimedb::{ReducerContext, Table};
 
 fn params() -> box3d_stdb::WorldParams {
@@ -60,7 +62,7 @@ pub struct MemProbe {
 
 #[spacetimedb::reducer]
 pub fn step_world(ctx: &ReducerContext, world_key: u64) -> Result<(), String> {
-    box3d_stdb::with_world(ctx, world_key, &params(), |_w| Ok(()), |_w| Ok(()))
+    box3d_stdb::with_world(ctx, world_key, &params(), |_w| Ok(()), |_w| Ok(())).map(|_| ())
 }
 
 #[spacetimedb::reducer]
@@ -82,6 +84,7 @@ pub fn fail_rebuild(ctx: &ReducerContext, world_key: u64) -> Result<(), String> 
         |_| Err("intentional rebuild failure".into()),
         |_| Ok(()),
     )
+    .map(|_| ())
 }
 
 #[spacetimedb::reducer]
@@ -133,6 +136,76 @@ pub fn drop_sphere(ctx: &ReducerContext, steps: u32) {
         gravity_z: world.gravity().z,
         awake_bodies: world.awake_body_count(),
     });
+}
+
+#[spacetimedb::reducer]
+pub fn mirror_spawn(ctx: &ReducerContext, world_key: u64, body_key: u64, z: f32) -> Result<(), String> {
+    box3d_stdb::with_world(ctx, world_key, &params(), |_| Ok(()), |w| {
+        let id = w.spawn(body_key, BodyDef::dynamic_at(Vec3::new(0.0, 0.0, z)))?;
+        id.create_sphere(Vec3::ZERO, 0.5, ShapeDef { density: 1.0, ..ShapeDef::default() });
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+/// Game-closure Err PROPAGATED (unlike poison_world's swallow): tx aborts, slot stays poisoned.
+#[spacetimedb::reducer]
+pub fn fail_game(ctx: &ReducerContext, world_key: u64) -> Result<(), String> {
+    box3d_stdb::with_world(ctx, world_key, &params(), |_| Ok(()), |_| {
+        Err::<(), String>("intentional game failure".into())
+    })
+    .map(|_| ())
+}
+
+#[spacetimedb::reducer]
+pub fn mirror_ground(ctx: &ReducerContext, world_key: u64, body_key: u64) -> Result<(), String> {
+    box3d_stdb::with_world(ctx, world_key, &params(), |_| Ok(()), |w| {
+        let id = w.spawn(body_key, BodyDef::static_at(Vec3::new(0.0, 0.0, -1.0)))?;
+        id.create_box(Vec3::new(50.0, 50.0, 1.0), ShapeDef::default());
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+#[spacetimedb::reducer]
+pub fn mirror_teleport(ctx: &ReducerContext, world_key: u64, body_key: u64, z: f32) -> Result<(), String> {
+    box3d_stdb::with_world(ctx, world_key, &params(), |_| Ok(()), |w| {
+        w.set_transform(body_key, Vec3::new(0.0, 0.0, z), Quat::IDENTITY)
+    })
+    .map(|_| ())
+}
+
+#[spacetimedb::reducer]
+pub fn mirror_destroy(ctx: &ReducerContext, world_key: u64, body_key: u64) -> Result<(), String> {
+    box3d_stdb::with_world(ctx, world_key, &params(), |_| Ok(()), |w| w.destroy(body_key)).map(|_| ())
+}
+
+#[spacetimedb::table(accessor = settle_result, public)]
+pub struct SettleResult {
+    #[primary_key]
+    #[auto_inc]
+    pub id: u64,
+    pub steps_taken: u32,
+    pub fell_asleep: bool,
+}
+
+/// Steps until the spawned mirror body falls asleep or `max_steps` is hit; records how many steps
+/// it took. Exercises the post-step delta commit (the mirror's `asleep` flag).
+#[spacetimedb::reducer]
+pub fn settle(ctx: &ReducerContext, world_key: u64, max_steps: u32) -> Result<(), String> {
+    let mut steps = 0;
+    let mut asleep = false;
+    while steps < max_steps && !asleep {
+        box3d_stdb::with_world(ctx, world_key, &params(), |_| Ok(()), |_| Ok(()))?;
+        steps += 1;
+        asleep = ctx.db.b3_body().world_key().filter(world_key).any(|r| r.asleep);
+    }
+    ctx.db.settle_result().insert(SettleResult {
+        id: 0,
+        steps_taken: steps,
+        fell_asleep: asleep,
+    });
+    Ok(())
 }
 
 /// n³ spheres rain onto a ground box — contact/solver heavy.

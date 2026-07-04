@@ -187,4 +187,5 @@ pub fn jump(ctx: &ReducerContext, world_key: u64) -> Result<(), String> {
             Ok(())
         },
     )
+    .map(|_| ())
 }

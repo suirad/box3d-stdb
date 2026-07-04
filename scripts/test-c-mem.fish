@@ -82,7 +82,7 @@ set bf (get_bytes final)
 set wf (get_worlds final)
 assert_eq "worlds final (leaked slot persists)" $wf $W1
 assert_eq "bytes final == B1 (leaked C world)" $bf $B1
-echo "leaked bytes vs baseline: "(math $bf - $b0)" (bounded I6 leak — one empty world's allocations)"
+echo "leaked bytes vs baseline: "(math $bf - $b0)" (deliberate bounded leak — one empty world's allocations, poisoned worlds are never destroyed)"
 
 echo ""
 echo "Results: $pass passed, $fail failed"

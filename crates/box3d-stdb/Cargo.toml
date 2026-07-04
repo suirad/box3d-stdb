@@ -12,6 +12,8 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 simd = ["box3d-sys/simd"]
+# Flips the b3_body mirror table public for zero-boilerplate client subscription.
+public-mirror = []
 
 [dependencies]
 spacetimedb = "2.6"
