@@ -5,6 +5,7 @@ version = "0.1.14"
 edition = "2021"
 links = "box3d"
 license = "MIT"
+repository = "https://github.com/suirad/box3d-stdb"
 description = "Raw Rust FFI bindings for Box3D, built for SpacetimeDB wasm modules"
 
 [features]

@@ -46,9 +46,6 @@ pub struct TickTimer {
 }
 
 fn spawn_scene(w: &mut box3d_stdb::WorldCtx<'_>) -> Result<(), String> {
-    // Disable sleeping world-wide: the id-tier API has no wake call yet, and a slept ball would
-    // ignore set_linear_velocity — revisit when a wake helper lands.
-    w.world().set_sleeping_enabled(false);
     let ground = w.spawn(GROUND_KEY, BodyDef::static_at(Vec3::new(0.0, 0.0, -1.0)))?;
     ground.create_box(Vec3::new(50.0, 50.0, 1.0), ShapeDef::default());
     // Fresh world: ball starts at z=5. On rebuild the glue overlays the surviving mirror row
@@ -142,6 +139,8 @@ pub fn jump(ctx: &ReducerContext, world_key: u64) -> Result<(), String> {
             // Grounded = resting height (radius 0.5 on ground top z=0) + small tolerance; a
             // contact check replaces this when step events are consumed.
             if t.p.z <= 0.51 {
+                // A resting ball is asleep and would ignore the velocity set.
+                w.wake(BALL_KEY)?;
                 id.set_linear_velocity(box3d::Vec3::new(0.0, 0.0, 6.0));
             }
             Ok(())

@@ -29,9 +29,11 @@ they build on (see README maintenance policy).
 - `b3_body` mirror table: per-body transform, velocities, and sleep flag, delta-committed from
   box3d's post-step move events — sleeping/static bodies cost nothing. Private by default;
   expose via consumer `#[view]`s or the `public-mirror` cargo feature.
-- `WorldCtx` mutators — `spawn`, `destroy`, `set_transform`, `body_id` — keep the C world, the
-  mirror row, and the id↔key maps consistent in a single call (user mutations never appear in
-  box3d's event stream, so they must write the mirror themselves).
+- `WorldCtx` mutators — `spawn`, `destroy`, `set_transform`, `wake`, `body_id` — keep the C
+  world, the mirror row, and the id↔key maps consistent in a single call (user mutations never
+  appear in box3d's event stream, so they must write the mirror themselves). `wake` unblocks
+  velocity sets on resting bodies, letting worlds keep sleeping enabled — a settled world costs
+  zero mirror traffic and zero broadcast bandwidth (measured).
 - Rebuild overlay: surviving mirror rows restore position *and* velocity onto freshly spawned
   bodies — a ball republished mid-flight resumes its arc (verified against ballistics). Stale
   rows are swept; orphaned cache slots from aborted create+step transactions are reconciled.
@@ -46,8 +48,9 @@ they build on (see README maintenance policy).
   keys are a hard error. `destroy_world` completes the lifecycle (idempotent).
 - `StepResult` events: simulation moves (with linear/angular velocities — the id-tier exposes
   no velocity getters, so move events are the consumer's only velocity channel), contact
-  begin/end, hits (point/normal/speed), sensor begin/end; body keys remapped, `None` for
-  bodies not spawned through the glue.
+  begin/end, hits (point/normal/speed), sensor begin/end, and joint force-threshold overloads
+  (`joint_bits`, consumer-correlated); body keys remapped, `None` for bodies not spawned
+  through the glue.
 
 ### Ephemeral worlds
 
@@ -81,8 +84,10 @@ they build on (see README maintenance policy).
 ### Known limitations
 
 - Cross-rebuild determinism is physically plausible, not bit-exact (solver warm-start state is
-  not persisted) — a lossless blob checkpoint is the planned fix.
-- No wake helper on the id tier yet; the demos disable sleeping to keep `set_linear_velocity`
-  effective on resting bodies.
-- Joints and post-spawn shape mutation are raw-API territory (escape hatch), not yet covered by
-  the keyed mirror API.
+  not persisted). A lossless blob checkpoint was investigated and parked: mirror restore is
+  measured-indistinguishable for game workloads, and true exactness would cost per-tick
+  whole-world serialization plus internal-ABI coupling. Revisit only for replay-grade
+  determinism consumers.
+- Joints and post-spawn shape mutation are raw-API territory by design: they are construction
+  state, so persist them in your own tables and re-apply in `rebuild_fn` (same contract as
+  spawns). Joint force-threshold events ARE surfaced (`StepEvents.joint_overloads`).

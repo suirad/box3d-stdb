@@ -27,13 +27,18 @@ crate-type = ["cdylib"]
 [dependencies]
 spacetimedb = "2.6"
 box3d = "0.1.14"
-box3d-stdb = { git = "https://github.com/<you>/box3d-stdb" }
+box3d-stdb = { git = "https://github.com/suirad/box3d-stdb", tag = "v0.1.14-r1" }
 
 # Reroute the wrapper's box3d-sys to the wasm-ready build in this repo.
-# Cargo only honors [patch] in the workspace root manifest.
+# Cargo only honors [patch] in the workspace root manifest. Pin the same tag.
 [patch.crates-io]
-box3d-sys = { git = "https://github.com/<you>/box3d-stdb" }
+box3d-sys = { git = "https://github.com/suirad/box3d-stdb", tag = "v0.1.14-r1" }
 ```
+
+> **Why git, not crates.io:** the drop-in `box3d-sys` must carry the exact upstream package name
+> for `[patch.crates-io]` to substitute — a name crates.io already owns — so this repo is
+> consumed as a git dependency by design. Pin a release tag (`v<box3d-sys version>-rN`), never a
+> branch.
 
 Register the world once, then one guarded call per tick — reconcile the cache, run your game
 logic, step, commit:
@@ -69,6 +74,12 @@ expose it to clients through your own `#[view]` (projected/filtered as you like)
 `public-mirror` feature for whole-table subscription. Raw `box3d` API stays available
 (`pub use box3d`, plus a `w.world()` escape hatch inside closures).
 
+**The construction contract:** the glue persists *dynamics* (pose/velocity/sleep); everything
+constructive — shapes, densities, joints, and any runtime changes to them — is yours to persist
+in your own tables and re-apply in `rebuild_fn`, exactly like spawns. Joints are raw-API
+(`w.world()` + `JointId`); their force-threshold events arrive in
+`StepResult.events.joint_overloads` for breakage logic.
+
 ### Realtime pacing
 
 SpacetimeDB's scheduler drifts (~8% under-firing measured against a 60 Hz
@@ -76,7 +87,10 @@ SpacetimeDB's scheduler drifts (~8% under-firing measured against a 60 Hz
 a 10-minute match ends at ~9m15s of simulation. `with_world_paced` repays wall-clock time in
 whole fixed-`dt` steps (0 to `max_catchup` per firing) from a replay-stable timestamp
 accumulator: determinism keeps its fixed `dt`, wall-clock fidelity comes from the step *count*.
-Measured: 0.3% sim-vs-wall deviation; 12 concurrent worlds all hold 60 Hz on ~54 Hz firings.
+Measured: 0.3% sim-vs-wall deviation; 12 concurrent 60 Hz worlds all hold rate on ~54 Hz
+scheduler firings (catch-up absorbs the contention), and a 15k-body overload degrades to its
+maximum sustainable rate then self-recovers to realtime once the scene settles — pacing needs
+no per-world tuning as world counts grow.
 
 Under sustained overload (step cost approaching `dt`), catch-up is capped and the excess
 backlog is dropped — the sim runs at its maximum sustainable rate instead of death-spiraling,
@@ -104,7 +118,7 @@ The knobs compose — pick by what the world is for:
 | **Durability** (persistent zones, resumable matches) | `Persistence::Mirrored` (default) | ~1.5–1.8× stepping while bodies are awake (0.3–0.5 µs per moving body per step; sleeping bodies are free — measured 512 asleep bodies stepping at pure call overhead) |
 | **Realtime accuracy** | `with_world_paced` on the scheduled tick (both modes) | negligible — one row field + integer math per firing |
 | **Zero-boilerplate client visibility** | `public-mirror` feature | whole mirror visible to every subscriber; use consumer `#[view]`s instead for filtering/interest management |
-| **Cheap idle worlds** | leave sleeping enabled (box3d default) | none — asleep bodies skip both solver and commit; disable sleep only if you mutate resting bodies via the id-tier (no wake call yet) |
+| **Cheap idle worlds** | leave sleeping enabled (box3d default) | none — asleep bodies skip solver, commit, and broadcast (a settled world is measured-silent); `w.wake(key)` before mutating a resting body |
 | **Burst absorption vs latency** | `max_catchup` (we use 4) | higher = repays longer stalls in one firing (bigger tx); lower = smoother per-firing cost, drops backlog sooner |
 | **Determinism auditing** | `BOX3D_FORCE_SCALAR=1` build | ~1.7× slower stepping; scalar and SIMD are bit-identical, so this is for isolating suspicion, not correctness |
 
@@ -153,9 +167,21 @@ These crates are **wasm-only** — native builds fail fast with a pointer to ups
   fetch it automatically).
 - `crates/box3d-stdb` — re-exports `box3d` plus the persistence layer: `with_world` (generation
   guard, poison handling, post-step delta commit), `WorldCtx` mutators (`spawn`/`destroy`/
-  `set_transform` keep the C world and the mirror consistent in one call), the `b3_world`/`b3_body`
+  `set_transform`/`wake` keep the C world and the mirror consistent in one call), the `b3_world`/`b3_body`
   tables, and `StepResult` events. Also `install_box3d_logging()` — call once from your `init`
   reducer to route box3d's internal warnings (`b3Log`) to the module log.
+
+## Releasing
+
+This repo is consumed as a pinned git dependency (see the Usage note — crates.io is not an
+option for a `[patch]`-target crate). To cut a release:
+
+1. Verify the runtime gates (Maintenance step 6) and that `CHANGELOG.md` covers the changes
+2. Move the `[Unreleased]` changelog section under a `v<box3d-sys version>-rN` heading
+3. Tag: `git tag v0.1.14-rN && git push --tags` — consumers pin this tag in both their
+   dependency and `[patch]` lines
+4. Consumers must clone with submodules (`--recurse-submodules`); cargo git deps handle this
+   automatically
 
 ## Maintenance (upstream version bump)
 

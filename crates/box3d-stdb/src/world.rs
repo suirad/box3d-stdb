@@ -120,7 +120,14 @@ pub struct BodyMove {
     pub fell_asleep: bool,
 }
 
-/// Contact/sensor/hit events surfaced by one [`with_world`] step.
+/// A joint whose force/torque exceeded its event threshold this step (box3d reports the joint,
+/// not the magnitudes). `joint_bits` round-trips via `box3d::JointId::from_bits` — joints are
+/// raw-API territory, so consumers correlate with their own tracking.
+pub struct JointOverload {
+    pub joint_bits: u64,
+}
+
+/// Contact/sensor/hit/joint events surfaced by one [`with_world`] step.
 pub struct StepEvents {
     pub moves: Vec<BodyMove>,
     pub contact_begins: Vec<ContactTouch>,
@@ -128,6 +135,7 @@ pub struct StepEvents {
     pub hits: Vec<ContactHit>,
     pub sensor_begins: Vec<ContactTouch>,
     pub sensor_ends: Vec<ContactTouch>,
+    pub joint_overloads: Vec<JointOverload>,
 }
 
 /// The `game` closure's return value plus the events its step produced.
@@ -252,6 +260,27 @@ impl WorldCtx<'_> {
         self.keys.insert(key, bits);
         self.keys_rev.insert(bits, key);
         Ok(id)
+    }
+
+    /// Wake the body for `key`. Err on unknown key.
+    ///
+    /// Setting velocities/impulses on a sleeping body has no effect — wake it first. (The
+    /// wrapper's id tier exposes no wake, hence this raw-sys helper.)
+    pub fn wake(&mut self, key: u64) -> Result<(), String> {
+        let bits = *self
+            .keys
+            .get(&key)
+            .ok_or_else(|| format!("box3d-stdb: unknown body key {key}"))?;
+        unsafe { sys::b3Body_SetAwake(body_raw(bits), true) };
+        // User mutations never reach the event stream; reflect the wake in the mirror now
+        // rather than waiting a step for the first move event.
+        if self.persistence == Persistence::Mirrored {
+            if let Some(mut row) = self.ctx.db.b3_body().body_key().find(key) {
+                row.asleep = false;
+                self.ctx.db.b3_body().body_key().update(row);
+            }
+        }
+        Ok(())
     }
 
     /// Destroy the body for `key` and delete its mirror row (mirrored worlds only). Err on
@@ -615,6 +644,7 @@ fn step_world<R>(
                 let mut hits = Vec::new();
                 let mut sensor_begins = Vec::new();
                 let mut sensor_ends = Vec::new();
+                let mut joint_overloads = Vec::new();
 
                 // Events are collected after EVERY step — box3d clears its event arrays on step,
                 // so anything not harvested inside the loop is lost.
@@ -692,6 +722,11 @@ fn step_world<R>(
                             .ends()
                             .map(|e| touch(keys_rev, e.sensor.to_bits(), e.visitor.to_bits())),
                     );
+                    joint_overloads.extend(slot.world.joint_events().iter().map(|e| {
+                        JointOverload {
+                            joint_bits: e.joint.to_bits(),
+                        }
+                    }));
                 }
 
                 // ONE mirror commit from the merged final states (Mirrored only) — intermediate
@@ -740,6 +775,7 @@ fn step_world<R>(
                         hits,
                         sensor_begins,
                         sensor_ends,
+                        joint_overloads,
                     },
                     steps_run: steps,
                 })

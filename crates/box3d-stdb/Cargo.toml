@@ -4,6 +4,7 @@ name = "box3d-stdb"
 version = "0.1.14"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/suirad/box3d-stdb"
 description = "SpacetimeDB integration for box3d: re-exports the box3d wrapper API"
 
 [lib]
