@@ -5,14 +5,8 @@ use box3d::{BodyDef, Quat, ShapeDef, Vec3, World};
 use box3d_stdb::b3_body;
 use spacetimedb::{ReducerContext, Table};
 
-fn params() -> box3d_stdb::WorldParams {
-    box3d_stdb::WorldParams {
-        gravity: Vec3::new(0.0, 0.0, -10.0),
-        capacity: Default::default(),
-        dt: 1.0 / 60.0,
-        substeps: 4,
-    }
-}
+const DT: f32 = 1.0 / 60.0;
+const SUBSTEPS: i32 = 4;
 
 #[spacetimedb::table(accessor = drop_result, public)]
 pub struct DropResult {
@@ -61,8 +55,25 @@ pub struct MemProbe {
 }
 
 #[spacetimedb::reducer]
+pub fn make_world(ctx: &ReducerContext, world_key: u64) -> Result<(), String> {
+    box3d_stdb::create_world(ctx, world_key, &box3d_stdb::WorldDef::default())
+}
+
+#[spacetimedb::reducer]
+pub fn make_ephemeral(ctx: &ReducerContext, world_key: u64) -> Result<(), String> {
+    box3d_stdb::create_world(
+        ctx,
+        world_key,
+        &box3d_stdb::WorldDef {
+            persistence: box3d_stdb::Persistence::Ephemeral,
+            ..Default::default()
+        },
+    )
+}
+
+#[spacetimedb::reducer]
 pub fn step_world(ctx: &ReducerContext, world_key: u64) -> Result<(), String> {
-    box3d_stdb::with_world(ctx, world_key, &params(), |_w| Ok(()), |_w| Ok(())).map(|_| ())
+    box3d_stdb::with_world(ctx, world_key, DT, SUBSTEPS, |_w| Ok(()), |_w| Ok(())).map(|_| ())
 }
 
 #[spacetimedb::reducer]
@@ -80,7 +91,8 @@ pub fn fail_rebuild(ctx: &ReducerContext, world_key: u64) -> Result<(), String> 
     box3d_stdb::with_world(
         ctx,
         world_key,
-        &params(),
+        DT,
+        SUBSTEPS,
         |_| Err("intentional rebuild failure".into()),
         |_| Ok(()),
     )
@@ -93,7 +105,8 @@ pub fn poison_world(ctx: &ReducerContext, world_key: u64) {
     if let Err(e) = box3d_stdb::with_world(
         ctx,
         world_key,
-        &params(),
+        DT,
+        SUBSTEPS,
         |_| Ok(()),
         |_| Err::<(), String>("intentional poison".into()),
     ) {
@@ -140,7 +153,7 @@ pub fn drop_sphere(ctx: &ReducerContext, steps: u32) {
 
 #[spacetimedb::reducer]
 pub fn mirror_spawn(ctx: &ReducerContext, world_key: u64, body_key: u64, z: f32) -> Result<(), String> {
-    box3d_stdb::with_world(ctx, world_key, &params(), |_| Ok(()), |w| {
+    box3d_stdb::with_world(ctx, world_key, DT, SUBSTEPS, |_| Ok(()), |w| {
         let id = w.spawn(body_key, BodyDef::dynamic_at(Vec3::new(0.0, 0.0, z)))?;
         id.create_sphere(Vec3::ZERO, 0.5, ShapeDef { density: 1.0, ..ShapeDef::default() });
         Ok(())
@@ -148,10 +161,21 @@ pub fn mirror_spawn(ctx: &ReducerContext, world_key: u64, body_key: u64, z: f32)
     .map(|_| ())
 }
 
+/// create_world + a failing step in ONE tx: the abort rolls the row back but the busy slot
+/// survives in memory — exercises with_world's missing-row orphan reconcile on the next call.
+#[spacetimedb::reducer]
+pub fn make_and_fail(ctx: &ReducerContext, world_key: u64) -> Result<(), String> {
+    box3d_stdb::create_world(ctx, world_key, &box3d_stdb::WorldDef::default())?;
+    box3d_stdb::with_world(ctx, world_key, DT, SUBSTEPS, |_| Ok(()), |_| {
+        Err::<(), String>("intentional failure after create".into())
+    })
+    .map(|_| ())
+}
+
 /// Game-closure Err PROPAGATED (unlike poison_world's swallow): tx aborts, slot stays poisoned.
 #[spacetimedb::reducer]
 pub fn fail_game(ctx: &ReducerContext, world_key: u64) -> Result<(), String> {
-    box3d_stdb::with_world(ctx, world_key, &params(), |_| Ok(()), |_| {
+    box3d_stdb::with_world(ctx, world_key, DT, SUBSTEPS, |_| Ok(()), |_| {
         Err::<(), String>("intentional game failure".into())
     })
     .map(|_| ())
@@ -159,7 +183,7 @@ pub fn fail_game(ctx: &ReducerContext, world_key: u64) -> Result<(), String> {
 
 #[spacetimedb::reducer]
 pub fn mirror_ground(ctx: &ReducerContext, world_key: u64, body_key: u64) -> Result<(), String> {
-    box3d_stdb::with_world(ctx, world_key, &params(), |_| Ok(()), |w| {
+    box3d_stdb::with_world(ctx, world_key, DT, SUBSTEPS, |_| Ok(()), |w| {
         let id = w.spawn(body_key, BodyDef::static_at(Vec3::new(0.0, 0.0, -1.0)))?;
         id.create_box(Vec3::new(50.0, 50.0, 1.0), ShapeDef::default());
         Ok(())
@@ -169,7 +193,7 @@ pub fn mirror_ground(ctx: &ReducerContext, world_key: u64, body_key: u64) -> Res
 
 #[spacetimedb::reducer]
 pub fn mirror_teleport(ctx: &ReducerContext, world_key: u64, body_key: u64, z: f32) -> Result<(), String> {
-    box3d_stdb::with_world(ctx, world_key, &params(), |_| Ok(()), |w| {
+    box3d_stdb::with_world(ctx, world_key, DT, SUBSTEPS, |_| Ok(()), |w| {
         w.set_transform(body_key, Vec3::new(0.0, 0.0, z), Quat::IDENTITY)
     })
     .map(|_| ())
@@ -177,7 +201,7 @@ pub fn mirror_teleport(ctx: &ReducerContext, world_key: u64, body_key: u64, z: f
 
 #[spacetimedb::reducer]
 pub fn mirror_destroy(ctx: &ReducerContext, world_key: u64, body_key: u64) -> Result<(), String> {
-    box3d_stdb::with_world(ctx, world_key, &params(), |_| Ok(()), |w| w.destroy(body_key)).map(|_| ())
+    box3d_stdb::with_world(ctx, world_key, DT, SUBSTEPS, |_| Ok(()), |w| w.destroy(body_key)).map(|_| ())
 }
 
 #[spacetimedb::table(accessor = settle_result, public)]
@@ -196,7 +220,7 @@ pub fn settle(ctx: &ReducerContext, world_key: u64, max_steps: u32) -> Result<()
     let mut steps = 0;
     let mut asleep = false;
     while steps < max_steps && !asleep {
-        box3d_stdb::with_world(ctx, world_key, &params(), |_| Ok(()), |_| Ok(()))?;
+        box3d_stdb::with_world(ctx, world_key, DT, SUBSTEPS, |_| Ok(()), |_| Ok(()))?;
         steps += 1;
         asleep = ctx.db.b3_body().world_key().filter(world_key).any(|r| r.asleep);
     }
@@ -205,6 +229,64 @@ pub fn settle(ctx: &ReducerContext, world_key: u64, max_steps: u32) -> Result<()
         steps_taken: steps,
         fell_asleep: asleep,
     });
+    Ok(())
+}
+
+/// Mirror-path bench: n³ keyed spheres over a ground box, `steps` with_world calls (one step +
+/// delta commit each). Compare wall-clock against `bench` (raw world, no tables) from the CLI.
+/// Re-running with the same `world_key` errors at create_world — `remove_world` between runs.
+#[spacetimedb::reducer]
+pub fn bench_mirror(ctx: &ReducerContext, world_key: u64, n: u32, steps: u32) -> Result<(), String> {
+    // Body keys occupy [world_key*1e6, world_key*1e6 + n³]; past 1e6 they'd collide with the
+    // next world's block (spawn would Err cleanly, but the bench would just fail).
+    if u64::from(n).pow(3) >= 1_000_000 {
+        return Err("n too large: n^3 must stay under 1,000,000".into());
+    }
+    box3d_stdb::create_world(ctx, world_key, &box3d_stdb::WorldDef::default())?;
+    // Rebuild spawns the scene on the first call (cold world); warm iterations skip it.
+    for _ in 0..steps {
+        box3d_stdb::with_world(ctx, world_key, DT, SUBSTEPS, |w| spawn_scene_bench(w, world_key, n), |_| Ok(()))?;
+    }
+    Ok(())
+}
+
+fn spawn_scene_bench(
+    w: &mut box3d_stdb::WorldCtx<'_>,
+    world_key: u64,
+    n: u32,
+) -> Result<(), String> {
+    let g = w.spawn(world_key * 1_000_000, BodyDef::static_at(Vec3::new(0.0, 0.0, -1.0)))?;
+    g.create_box(Vec3::new(50.0, 50.0, 1.0), ShapeDef::default());
+    let def = ShapeDef { density: 1.0, ..ShapeDef::default() };
+    let spacing = 1.05;
+    let off = (n as f32 - 1.0) * spacing * 0.5;
+    let mut key = world_key * 1_000_000 + 1;
+    for i in 0..n { for j in 0..n { for k in 0..n {
+        let pos = Vec3::new(i as f32 * spacing - off, j as f32 * spacing - off, 1.0 + k as f32 * spacing);
+        let b = w.spawn(key, BodyDef::dynamic_at(pos))?;
+        b.create_sphere(Vec3::ZERO, 0.5, def);
+        key += 1;
+    }}}
+    Ok(())
+}
+
+/// bench_mirror's scene + stepping, but ephemeral: measures pure guard overhead (no mirror I/O).
+#[spacetimedb::reducer]
+pub fn bench_ephemeral(ctx: &ReducerContext, world_key: u64, n: u32, steps: u32) -> Result<(), String> {
+    if u64::from(n).pow(3) >= 1_000_000 {
+        return Err("n too large: n^3 must stay under 1,000,000".into());
+    }
+    box3d_stdb::create_world(
+        ctx,
+        world_key,
+        &box3d_stdb::WorldDef {
+            persistence: box3d_stdb::Persistence::Ephemeral,
+            ..Default::default()
+        },
+    )?;
+    for _ in 0..steps {
+        box3d_stdb::with_world(ctx, world_key, DT, SUBSTEPS, |w| spawn_scene_bench(w, world_key, n), |_| Ok(()))?;
+    }
     Ok(())
 }
 

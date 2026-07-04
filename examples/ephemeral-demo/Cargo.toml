@@ -1,0 +1,23 @@
+# Ephemeral-world consumer example for box3d-stdb: no mirror rows, event-table broadcast.
+[package]
+name = "box3d-ephemeral-demo"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+# SIMD is on by default (from box3d-sys); build with BOX3D_FORCE_SCALAR=1 for scalar.
+[dependencies]
+spacetimedb = "2.6"
+box3d = "0.1.14"
+box3d-sys = "0.1.14"
+box3d-stdb = { path = "../../crates/box3d-stdb" }
+log = "0.4"
+
+# In-tree example: path patch. External consumers use git = "<this repo>".
+[patch.crates-io]
+box3d-sys = { path = "../../crates/box3d-sys" }
+
+# Opt out of the repo workspace — this is a standalone module project.
+[workspace]

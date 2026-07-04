@@ -3,14 +3,18 @@
 //! The model: **your tables are the record of truth**; the in-memory `b3World` is a rebuildable
 //! cache validated by a durable generation stamp. Reducers are transactional — table writes roll
 //! back on abort, linear memory does not — so the cache is never trusted without the stamp.
-//! Drive everything through [`with_world`]; it reconciles, runs your game logic, and steps.
+//! Register a world once with [`create_world`] (its definition is stored durably), then drive
+//! everything through [`with_world`]; it reconciles, runs your game logic, and steps.
 //!
 //! ```ignore
+//! box3d_stdb::create_world(ctx, world_key, &WorldDef::default())?; // once, e.g. match setup
+//!
 //! #[spacetimedb::reducer]
 //! fn tick(ctx: &ReducerContext, timer: TickTimer) -> Result<(), String> {
-//!     box3d_stdb::with_world(ctx, timer.world_key, &params(),
+//!     box3d_stdb::with_world(ctx, timer.world_key, 1.0 / 60.0, 4,
 //!         |w| rebuild_bodies(ctx, w),   // construction-only, after cache drops
 //!         |w| apply_inputs(ctx, w))     // per-tick game logic, before the step
+//!         .map(|_| ())
 //! }
 //! ```
 //!

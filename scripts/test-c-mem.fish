@@ -39,6 +39,9 @@ probe baseline
 set b0 (get_bytes baseline)
 set w0 (get_worlds baseline)
 
+# make_world is row-only (no C allocation) — byte/world baselines are unaffected;
+# the C world is built lazily by the first step.
+spacetime call $DB make_world 100
 spacetime call $DB step_world 100
 probe after-create
 set b1 (get_bytes after-create)
@@ -57,12 +60,15 @@ probe after-destroy
 assert_eq "bytes after destroy" (get_bytes after-destroy) $b0
 assert_eq "worlds after destroy" (get_worlds after-destroy) $w0
 
+# the row must exist first: fail_rebuild's rebuild-Err path only runs on a cold rebuild
+spacetime call $DB make_world 101
 # reducer failure is expected; don't abort
 spacetime call $DB fail_rebuild 101; or true
 probe after-failed-rebuild
 assert_eq "bytes after failed rebuild" (get_bytes after-failed-rebuild) $b0
 assert_eq "worlds after failed rebuild" (get_worlds after-failed-rebuild) $w0
 
+spacetime call $DB make_world 200
 spacetime call $DB step_world 200
 probe before-poison
 set B1 (get_bytes before-poison)
@@ -83,6 +89,18 @@ set wf (get_worlds final)
 assert_eq "worlds final (leaked slot persists)" $wf $W1
 assert_eq "bytes final == B1 (leaked C world)" $bf $B1
 echo "leaked bytes vs baseline: "(math $bf - $b0)" (deliberate bounded leak — one empty world's allocations, poisoned worlds are never destroyed)"
+
+# Orphan reconcile: create_world + a failing step in ONE tx — the abort rolls the row back but
+# the busy slot survives. The next with_world must forget it (leak, never destroy) then error.
+probe before-orphan
+set wo (get_worlds before-orphan)
+set bo (get_bytes before-orphan)
+spacetime call $DB make_and_fail 300; or true
+spacetime call $DB step_world 300; or true
+probe after-orphan
+# +1 proves the forget: a wrongful b3DestroyWorld would return the count to baseline
+assert_eq "worlds after orphan reconcile (forgotten, not destroyed)" (get_worlds after-orphan) (math $wo + 1)
+assert_eq "bytes after orphan reconcile (one world leaked)" (math (get_bytes after-orphan) - $bo) 164380
 
 echo ""
 echo "Results: $pass passed, $fail failed"
