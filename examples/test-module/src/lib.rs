@@ -290,6 +290,75 @@ pub fn bench_ephemeral(ctx: &ReducerContext, world_key: u64, n: u32, steps: u32)
     Ok(())
 }
 
+/// Steps an existing bench world (create via bench_mirror/bench_ephemeral first). The rebuild
+/// closure respawns the bench scene, so a cold call after a republish measures rebuild+overlay
+/// at scale.
+#[spacetimedb::reducer]
+pub fn bench_continue(ctx: &ReducerContext, world_key: u64, n: u32, steps: u32) -> Result<(), String> {
+    for _ in 0..steps {
+        box3d_stdb::with_world(ctx, world_key, DT, SUBSTEPS, |w| spawn_scene_bench(w, world_key, n), |_| Ok(()))?;
+    }
+    Ok(())
+}
+
+#[spacetimedb::table(accessor = bench_timer, scheduled(bench_tick))]
+pub struct BenchTimer {
+    #[primary_key]
+    #[auto_inc]
+    pub scheduled_id: u64,
+    pub scheduled_at: spacetimedb::ScheduleAt,
+    pub world_key: u64,
+    pub n: u32,
+}
+
+/// 60 Hz paced tick for a bench world.
+#[spacetimedb::reducer]
+pub fn bench_tick(ctx: &ReducerContext, timer: BenchTimer) -> Result<(), String> {
+    if ctx.sender() != ctx.database_identity() {
+        return Err("bench_tick may only be called by the scheduler".into());
+    }
+    box3d_stdb::with_world_paced(ctx, timer.world_key, DT, SUBSTEPS, 4,
+        |w| spawn_scene_bench(w, timer.world_key, timer.n), |_| Ok(()))
+    .map(|_| ())
+}
+
+/// Create a bench world (mirrored or ephemeral) with an n³ scene and start ticking it at 60 Hz.
+#[spacetimedb::reducer]
+pub fn start_ticking(ctx: &ReducerContext, world_key: u64, n: u32, ephemeral: bool) -> Result<(), String> {
+    if u64::from(n).pow(3) >= 1_000_000 {
+        return Err("n too large: n^3 must stay under 1,000,000".into());
+    }
+    if ctx.db.bench_timer().iter().any(|t| t.world_key == world_key) {
+        return Err(format!("world {world_key} already ticking"));
+    }
+    let def = if ephemeral {
+        box3d_stdb::WorldDef { persistence: box3d_stdb::Persistence::Ephemeral, ..Default::default() }
+    } else {
+        box3d_stdb::WorldDef::default()
+    };
+    box3d_stdb::create_world(ctx, world_key, &def)?;
+    ctx.db.bench_timer().insert(BenchTimer {
+        scheduled_id: 0,
+        scheduled_at: spacetimedb::ScheduleAt::Interval(spacetimedb::TimeDuration::from_micros(16_667)),
+        world_key,
+        n,
+    });
+    Ok(())
+}
+
+/// Stop ticking and destroy a bench world.
+#[spacetimedb::reducer]
+pub fn stop_ticking(ctx: &ReducerContext, world_key: u64) -> Result<(), String> {
+    let stale: Vec<u64> = ctx.db.bench_timer().iter()
+        .filter(|t| t.world_key == world_key)
+        .map(|t| t.scheduled_id)
+        .collect();
+    for id in stale {
+        ctx.db.bench_timer().scheduled_id().delete(id);
+    }
+    box3d_stdb::destroy_world(ctx, world_key)
+}
+
 /// n³ spheres rain onto a ground box — contact/solver heavy.
 #[spacetimedb::reducer]
 pub fn bench(ctx: &ReducerContext, n: u32, steps: u32) {

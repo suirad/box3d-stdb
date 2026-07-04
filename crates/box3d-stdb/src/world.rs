@@ -11,15 +11,18 @@ use spacetimedb::Table;
 /// Durable per-world stamp: the authority the in-memory world is validated against. Also stores
 /// the world's construction definition — rebuilds read it here.
 ///
-/// `generation` bumps on every [`with_world`] entry; `tick` counts committed steps. The table is
-/// private — expose `tick` to clients through your own `#[view]` if they need it (the row type
-/// and accessor trait are re-exported for exactly that).
+/// `generation` bumps on every [`with_world`]/[`with_world_paced`] entry; `tick` counts committed
+/// steps. The table is private — expose `tick` to clients through your own `#[view]` if they need
+/// it (the row type and accessor trait are re-exported for exactly that).
 #[spacetimedb::table(accessor = b3_world)]
 pub struct B3WorldRow {
     #[primary_key]
     pub world_key: u64,
     pub generation: u64,
     pub tick: u64,
+    /// [`with_world_paced`]'s simulated-time frontier, micros since the Unix epoch; 0 = never
+    /// paced-stepped. [`with_world`] leaves it untouched.
+    pub last_step_at_micros: i64,
     pub ephemeral: bool,
     pub gx: f32,
     pub gy: f32,
@@ -131,6 +134,13 @@ pub struct StepEvents {
 pub struct StepResult<R> {
     pub value: R,
     pub events: StepEvents,
+}
+
+/// [`with_world_paced`]'s result: the game value, merged events, and how many fixed-dt steps ran.
+pub struct PacedResult<R> {
+    pub value: R,
+    pub events: StepEvents,
+    pub steps_run: u32,
 }
 
 struct WorldSlot {
@@ -308,6 +318,7 @@ pub fn create_world(
         world_key,
         generation: 0,
         tick: 0,
+        last_step_at_micros: 0,
         ephemeral: def.persistence == Persistence::Ephemeral,
         gx: def.gravity.x,
         gy: def.gravity.y,
@@ -344,6 +355,10 @@ pub fn create_world(
 /// table state. That includes spawn *order* — the solver is creation-order sensitive, so never
 /// drive spawns from an unordered map; iterate your tables in a stable key order.
 ///
+/// On a world driven by [`with_world_paced`], each `with_world` call injects one `dt` of
+/// simulation the pacing clock never accounts for — sim time drifts ahead of real time by `dt`
+/// per call. Fine for occasional event reducers; don't mix the two as peers.
+///
 /// # Errors
 /// An `Err` from `game` **poisons the world** — the closure may have half-applied its mutations,
 /// so the cached world is abandoned (deliberately leaked, never destroyed) and rebuilt on the
@@ -362,7 +377,55 @@ pub fn with_world<R>(
     rebuild: impl FnOnce(&mut WorldCtx<'_>) -> Result<(), String>,
     game: impl FnOnce(&mut WorldCtx<'_>) -> Result<R, String>,
 ) -> Result<StepResult<R>, String> {
-    WORLDS.with(|cell| -> Result<StepResult<R>, String> {
+    step_world(ctx, world_key, dt, substeps, Pacing::Single, rebuild, game).map(|p| StepResult {
+        value: p.value,
+        events: p.events,
+    })
+}
+
+/// Like [`with_world`], but runs as many fixed-`dt` steps as wall-clock time owes the world
+/// (0..=max_catchup per call), so simulation time tracks real time regardless of scheduler
+/// drift. Determinism is preserved: `dt` is fixed and the step count derives from the
+/// replay-stable reducer timestamp.
+///
+/// `game` runs ONCE before the catch-up loop — inputs arrive via tables, so re-applying them
+/// per step would double-apply. If no full `dt` has elapsed, `game` still runs (and may mutate)
+/// but no step, mirror commit, or tick advance happens (`steps_run == 0`).
+///
+/// When the backlog exceeds `max_catchup` steps, the excess time is DROPPED (logged at debug) —
+/// carrying it forward would death-spiral an overloaded scheduler.
+pub fn with_world_paced<R>(
+    ctx: &spacetimedb::ReducerContext,
+    world_key: u64,
+    dt: f32,
+    substeps: i32,
+    max_catchup: u32,
+    rebuild: impl FnOnce(&mut WorldCtx<'_>) -> Result<(), String>,
+    game: impl FnOnce(&mut WorldCtx<'_>) -> Result<R, String>,
+) -> Result<PacedResult<R>, String> {
+    let pacing = Pacing::Realtime { max_catchup };
+    step_world(ctx, world_key, dt, substeps, pacing, rebuild, game)
+}
+
+/// How one call advances simulation time: exactly one step, or as many fixed-`dt` steps as
+/// wall-clock time owes (bounded by `max_catchup`).
+enum Pacing {
+    Single,
+    Realtime { max_catchup: u32 },
+}
+
+/// Shared body of [`with_world`] and [`with_world_paced`]; only the step count/stamp handling
+/// differs, everything else must stay behaviorally identical between the two.
+fn step_world<R>(
+    ctx: &spacetimedb::ReducerContext,
+    world_key: u64,
+    dt: f32,
+    substeps: i32,
+    pacing: Pacing,
+    rebuild: impl FnOnce(&mut WorldCtx<'_>) -> Result<(), String>,
+    game: impl FnOnce(&mut WorldCtx<'_>) -> Result<R, String>,
+) -> Result<PacedResult<R>, String> {
+    WORLDS.with(|cell| -> Result<PacedResult<R>, String> {
         // Single-threaded module: the only way this borrow can fail is a reentrant call from
         // inside a with_world closure — a consumer bug, so panic rather than thread a Result.
         let mut map = cell
@@ -481,6 +544,49 @@ pub fn with_world<R>(
             slot.busy = true;
         }
 
+        // Step plan. `new_stamp: None` = leave `last_step_at_micros` untouched (unpaced calls
+        // must not disturb a paced schedule on the same world).
+        let (steps, new_stamp): (u32, Option<i64>) = match pacing {
+            Pacing::Single => (1, None),
+            Pacing::Realtime { max_catchup } => {
+                let now = ctx.timestamp.to_micros_since_unix_epoch();
+                // Truncating dt to whole micros loses <1µs per step; for a fixed dt that is a
+                // constant, replay-stable rounding — negligible next to scheduler jitter.
+                let dt_micros = (f64::from(dt) * 1e6) as i64;
+                // dt of 0/NaN/negative would divide by zero below — on a scheduled reducer
+                // that's a permanent panic loop, so reject loudly instead.
+                if dt_micros <= 0 {
+                    return Err(format!(
+                        "box3d-stdb: with_world_paced requires dt >= 1µs (got {dt})"
+                    ));
+                }
+                // max_catchup 0 would freeze the world: the backlog-drop stamp write is gated
+                // on steps > 0, so the stamp could never advance again.
+                let max_catchup = max_catchup.max(1);
+                let stamp = cur.last_step_at_micros;
+                if stamp == 0 {
+                    // First firing starts the clock.
+                    (1, Some(now))
+                } else {
+                    let elapsed = now - stamp;
+                    let steps = (elapsed / dt_micros).max(0);
+                    if steps <= i64::from(max_catchup) {
+                        // Stamp advances by whole steps only — the sub-dt remainder carries.
+                        (steps as u32, Some(stamp + steps * dt_micros))
+                    } else {
+                        // Excess backlog is dropped, not carried: carrying it would death-spiral
+                        // an overloaded scheduler.
+                        log::debug!(
+                            "box3d-stdb: world {world_key} step backlog exceeds \
+                             max_catchup={max_catchup}; dropping {} µs",
+                            elapsed - i64::from(max_catchup) * dt_micros
+                        );
+                        (max_catchup, Some(now))
+                    }
+                }
+            }
+        };
+
         let game_result = {
             let slot = map.get_mut(&world_key).unwrap();
             game(&mut WorldCtx {
@@ -499,108 +605,144 @@ pub fn with_world<R>(
             Err(e) => Err(e),
             Ok(r) => {
                 let slot = map.get_mut(&world_key).unwrap();
-                slot.world.step(dt, substeps);
 
-                // Surface simulation moves in StepEvents (all worlds) and commit them to the
-                // mirror (Mirrored only). BodyEvents<'world> borrows the world, so collect into
-                // owned data first — the borrow must end before we take &mut slot.warned_unknown
-                // and write mirror rows.
-                let moves: Vec<_> = slot.world.body_events().moves().collect();
-                let mut body_moves = Vec::new();
-                for ev in moves {
-                    let bits = ev.body.to_bits();
-                    let Some(body_key) = slot.keys_rev.get(&bits).copied() else {
-                        // Warn once, not per-body-per-tick: a raw-created body (not spawned
-                        // through the glue) has no mirror row, and the log would otherwise flood.
-                        if !slot.warned_unknown {
-                            log::warn!(
-                                "box3d-stdb: world {world_key} moved a body not spawned through \
-                                 the glue; it is absent from move events and the mirror"
-                            );
-                            slot.warned_unknown = true;
-                        }
-                        continue;
-                    };
-                    let t = ev.transform;
-                    // Fetched for every mode: the id-tier API has no velocity getters, so the
-                    // move event is the only velocity channel consumers have.
-                    let raw = body_raw(bits);
-                    let lin = unsafe { sys::b3Body_GetLinearVelocity(raw) };
-                    let ang = unsafe { sys::b3Body_GetAngularVelocity(raw) };
-                    body_moves.push(BodyMove {
-                        body_key,
-                        position: (t.p.x, t.p.y, t.p.z),
-                        rotation: (t.q.v.x, t.q.v.y, t.q.v.z, t.q.s),
-                        linear_velocity: (lin.x, lin.y, lin.z),
-                        angular_velocity: (ang.x, ang.y, ang.z),
-                        fell_asleep: ev.fell_asleep,
-                    });
-                    if persistence == Persistence::Ephemeral {
-                        continue;
+                // Moves merge per body with latest-write-wins: a body that moves in step 1 then
+                // sleeps in step 2 of 3 must reach the single mirror commit with its resting
+                // state and fell_asleep flag. Contacts/sensors/hits just accumulate.
+                let mut merged: HashMap<u64, BodyMove> = HashMap::new();
+                let mut contact_begins = Vec::new();
+                let mut contact_ends = Vec::new();
+                let mut hits = Vec::new();
+                let mut sensor_begins = Vec::new();
+                let mut sensor_ends = Vec::new();
+
+                // Events are collected after EVERY step — box3d clears its event arrays on step,
+                // so anything not harvested inside the loop is lost.
+                for _ in 0..steps {
+                    slot.world.step(dt, substeps);
+
+                    // BodyEvents<'world> borrows the world, so collect into owned data first —
+                    // the borrow must end before we take &mut slot.warned_unknown.
+                    let moves: Vec<_> = slot.world.body_events().moves().collect();
+                    for ev in moves {
+                        let bits = ev.body.to_bits();
+                        let Some(body_key) = slot.keys_rev.get(&bits).copied() else {
+                            // Warn once, not per-body-per-tick: a raw-created body (not spawned
+                            // through the glue) has no mirror row, and the log would otherwise
+                            // flood.
+                            if !slot.warned_unknown {
+                                log::warn!(
+                                    "box3d-stdb: world {world_key} moved a body not spawned \
+                                     through the glue; it is absent from move events and the \
+                                     mirror"
+                                );
+                                slot.warned_unknown = true;
+                            }
+                            continue;
+                        };
+                        let t = ev.transform;
+                        // Fetched per step, for every mode: the id-tier API has no velocity
+                        // getters, so the move event is the only velocity channel consumers
+                        // have — and the merged entry must carry each body's LATEST velocities.
+                        let raw = body_raw(bits);
+                        let lin = unsafe { sys::b3Body_GetLinearVelocity(raw) };
+                        let ang = unsafe { sys::b3Body_GetAngularVelocity(raw) };
+                        merged.insert(
+                            body_key,
+                            BodyMove {
+                                body_key,
+                                position: (t.p.x, t.p.y, t.p.z),
+                                rotation: (t.q.v.x, t.q.v.y, t.q.v.z, t.q.s),
+                                linear_velocity: (lin.x, lin.y, lin.z),
+                                angular_velocity: (ang.x, ang.y, ang.z),
+                                fell_asleep: ev.fell_asleep,
+                            },
+                        );
                     }
-                    if let Some(mut row) = ctx.db.b3_body().body_key().find(body_key) {
-                        row.px = t.p.x;
-                        row.py = t.p.y;
-                        row.pz = t.p.z;
-                        row.qx = t.q.v.x;
-                        row.qy = t.q.v.y;
-                        row.qz = t.q.v.z;
-                        row.qw = t.q.s;
-                        row.vx = lin.x;
-                        row.vy = lin.y;
-                        row.vz = lin.z;
-                        row.wx = ang.x;
-                        row.wy = ang.y;
-                        row.wz = ang.z;
-                        row.asleep = ev.fell_asleep;
-                        ctx.db.b3_body().body_key().update(row);
+
+                    // Event collection: shape → body → keys_rev → Option<u64>.
+                    let keys_rev = &slot.keys_rev;
+                    let contact = slot.world.contact_events();
+                    let sensor = slot.world.sensor_events();
+                    contact_begins.extend(
+                        contact
+                            .begins()
+                            .map(|e| touch(keys_rev, e.shape_a.to_bits(), e.shape_b.to_bits())),
+                    );
+                    contact_ends.extend(
+                        contact
+                            .ends()
+                            .map(|e| touch(keys_rev, e.shape_a.to_bits(), e.shape_b.to_bits())),
+                    );
+                    hits.extend(contact.hits().map(|e| ContactHit {
+                        body_key_a: shape_body_key(keys_rev, e.shape_a.to_bits()),
+                        body_key_b: shape_body_key(keys_rev, e.shape_b.to_bits()),
+                        point: (e.point.x, e.point.y, e.point.z),
+                        normal: (e.normal.x, e.normal.y, e.normal.z),
+                        approach_speed: e.approach_speed,
+                    }));
+                    // Sensor begin/end reuse ContactTouch: sensor→body_key_a, visitor→body_key_b.
+                    sensor_begins.extend(
+                        sensor
+                            .begins()
+                            .map(|e| touch(keys_rev, e.sensor.to_bits(), e.visitor.to_bits())),
+                    );
+                    sensor_ends.extend(
+                        sensor
+                            .ends()
+                            .map(|e| touch(keys_rev, e.sensor.to_bits(), e.visitor.to_bits())),
+                    );
+                }
+
+                // ONE mirror commit from the merged final states (Mirrored only) — intermediate
+                // catch-up transforms are never observable, so writing them would be wasted I/O.
+                if persistence == Persistence::Mirrored {
+                    for m in merged.values() {
+                        if let Some(mut row) = ctx.db.b3_body().body_key().find(m.body_key) {
+                            row.px = m.position.0;
+                            row.py = m.position.1;
+                            row.pz = m.position.2;
+                            row.qx = m.rotation.0;
+                            row.qy = m.rotation.1;
+                            row.qz = m.rotation.2;
+                            row.qw = m.rotation.3;
+                            row.vx = m.linear_velocity.0;
+                            row.vy = m.linear_velocity.1;
+                            row.vz = m.linear_velocity.2;
+                            row.wx = m.angular_velocity.0;
+                            row.wy = m.angular_velocity.1;
+                            row.wz = m.angular_velocity.2;
+                            row.asleep = m.fell_asleep;
+                            ctx.db.b3_body().body_key().update(row);
+                        }
                     }
                 }
 
-                // Event collection: shape → body → keys_rev → Option<u64>.
-                let keys_rev = &slot.keys_rev;
-                let contact = slot.world.contact_events();
-                let sensor = slot.world.sensor_events();
-                let events = StepEvents {
-                    moves: body_moves,
-                    contact_begins: contact
-                        .begins()
-                        .map(|e| touch(keys_rev, e.shape_a.to_bits(), e.shape_b.to_bits()))
-                        .collect(),
-                    contact_ends: contact
-                        .ends()
-                        .map(|e| touch(keys_rev, e.shape_a.to_bits(), e.shape_b.to_bits()))
-                        .collect(),
-                    hits: contact
-                        .hits()
-                        .map(|e| ContactHit {
-                            body_key_a: shape_body_key(keys_rev, e.shape_a.to_bits()),
-                            body_key_b: shape_body_key(keys_rev, e.shape_b.to_bits()),
-                            point: (e.point.x, e.point.y, e.point.z),
-                            normal: (e.normal.x, e.normal.y, e.normal.z),
-                            approach_speed: e.approach_speed,
-                        })
-                        .collect(),
-                    // Sensor begin/end reuse ContactTouch: sensor→body_key_a, visitor→body_key_b.
-                    sensor_begins: sensor
-                        .begins()
-                        .map(|e| touch(keys_rev, e.sensor.to_bits(), e.visitor.to_bits()))
-                        .collect(),
-                    sensor_ends: sensor
-                        .ends()
-                        .map(|e| touch(keys_rev, e.sensor.to_bits(), e.visitor.to_bits()))
-                        .collect(),
-                };
-
-                // Tick advances only now — after the step and its mirror commit actually happened.
-                ctx.db.b3_world().world_key().update(B3WorldRow {
-                    generation: new_gen,
-                    tick: cur.tick + 1,
-                    ..cur
-                });
+                // Tick advances only now — after the steps and their mirror commit actually
+                // happened. steps == 0 skips the write entirely: the eager bump already
+                // committed the generation, and tick/stamp must not move.
+                if steps > 0 {
+                    ctx.db.b3_world().world_key().update(B3WorldRow {
+                        generation: new_gen,
+                        tick: cur.tick + u64::from(steps),
+                        last_step_at_micros: new_stamp.unwrap_or(cur.last_step_at_micros),
+                        ..cur
+                    });
+                }
 
                 slot.busy = false;
-                Ok(StepResult { value: r, events })
+                Ok(PacedResult {
+                    value: r,
+                    events: StepEvents {
+                        moves: merged.into_values().collect(),
+                        contact_begins,
+                        contact_ends,
+                        hits,
+                        sensor_begins,
+                        sensor_ends,
+                    },
+                    steps_run: steps,
+                })
             }
         }
     })

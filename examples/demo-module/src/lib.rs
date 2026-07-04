@@ -101,13 +101,13 @@ pub fn create_world(ctx: &ReducerContext, world_key: u64) -> Result<(), String> 
     Ok(())
 }
 
-/// Scheduled step; one physics tick per firing.
+/// Scheduled step; wall-clock paced — runs however many fixed-DT steps real time owes (≤4).
 #[spacetimedb::reducer]
 pub fn tick(ctx: &ReducerContext, timer: TickTimer) -> Result<(), String> {
     if ctx.sender() != ctx.database_identity() {
         return Err("tick may only be called by the scheduler".into());
     }
-    box3d_stdb::with_world(ctx, timer.world_key, DT, SUBSTEPS, spawn_scene, |_w| Ok(()))
+    box3d_stdb::with_world_paced(ctx, timer.world_key, DT, SUBSTEPS, 4, spawn_scene, |_w| Ok(()))
         .map(|_| ())
 }
 

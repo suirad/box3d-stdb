@@ -40,7 +40,7 @@ logic, step, commit:
 
 ```rust
 use box3d::{BodyDef, Vec3};
-use box3d_stdb::{create_world, with_world, WorldDef};
+use box3d_stdb::{create_world, with_world_paced, WorldDef};
 
 // once, e.g. match setup — stores the definition (gravity -10z, mirrored);
 // the C world itself is built lazily by the first with_world call
@@ -48,22 +48,41 @@ create_world(ctx, world_key, &WorldDef::default())?;
 
 #[spacetimedb::reducer]
 fn tick(ctx: &ReducerContext, timer: TickTimer) -> Result<(), String> {
-    let res = with_world(ctx, timer.world_key, 1.0 / 60.0, 4,
+    let res = with_world_paced(ctx, timer.world_key, 1.0 / 60.0, 4, /*max_catchup*/ 4,
         // rebuild: construction only — recreate bodies from YOUR tables after a cache drop;
         // the glue restores each body's transform/velocity from its mirror row
         |w| { w.spawn(BALL, BodyDef::dynamic_at(Vec3::new(0.0, 0.0, 5.0)))?; Ok(()) },
         // game: per-tick logic, before integration
         |w| { /* inputs, impulses, spawns */ Ok(()) },
     )?;
-    // res.events: simulation moves + contact/sensor/hit events from this step
+    // res.events: simulation moves + contact/sensor/hit events; res.steps_run: 0..=4
     Ok(())
 }
 ```
+
+For event-style reducers (a player input outside the tick), `with_world` runs exactly one step
+with the same closures — note each such call adds one `dt` of simulation the pacing clock
+doesn't account for.
 
 Body state lives in the private `b3_body` mirror table (transform, velocities, sleep flag) —
 expose it to clients through your own `#[view]` (projected/filtered as you like) or flip the
 `public-mirror` feature for whole-table subscription. Raw `box3d` API stays available
 (`pub use box3d`, plus a `w.world()` escape hatch inside closures).
+
+### Realtime pacing
+
+SpacetimeDB's scheduler drifts (~8% under-firing measured against a 60 Hz
+`ScheduleAt::Interval`), and a naive one-step-per-firing tick silently loses that time —
+a 10-minute match ends at ~9m15s of simulation. `with_world_paced` repays wall-clock time in
+whole fixed-`dt` steps (0 to `max_catchup` per firing) from a replay-stable timestamp
+accumulator: determinism keeps its fixed `dt`, wall-clock fidelity comes from the step *count*.
+Measured: 0.3% sim-vs-wall deviation; 12 concurrent worlds all hold 60 Hz on ~54 Hz firings.
+
+Under sustained overload (step cost approaching `dt`), catch-up is capped and the excess
+backlog is dropped — the sim runs at its maximum sustainable rate instead of death-spiraling,
+and returns to realtime by itself when load falls (verified with a 15k-body world). During an
+N-step catch-up the game closure runs once (table-borne inputs must not re-apply per step),
+events are collected from every step, and the mirror commits once from each body's final state.
 
 ### Ephemeral worlds
 
@@ -74,6 +93,24 @@ to raw box3d
 abort-safety guard still applies; a cache drop just respawns the world fresh. Per-tick positions
 come back in `StepResult.events.moves` — pipe them to a broadcast event table for clients
 (`examples/ephemeral-demo` shows the pattern). Persistence is fixed at world creation.
+
+### Choosing a configuration
+
+The knobs compose — pick by what the world is for:
+
+| Goal | Configuration | What you pay |
+| --- | --- | --- |
+| **Max sim speed** (lobby matches, cosmetic physics) | `Persistence::Ephemeral` + `with_world_paced` | state resets to spawn on any cache drop; clients need an event-table pipe for positions |
+| **Durability** (persistent zones, resumable matches) | `Persistence::Mirrored` (default) | ~1.5–1.8× stepping while bodies are awake (0.3–0.5 µs per moving body per step; sleeping bodies are free — measured 512 asleep bodies stepping at pure call overhead) |
+| **Realtime accuracy** | `with_world_paced` on the scheduled tick (both modes) | negligible — one row field + integer math per firing |
+| **Zero-boilerplate client visibility** | `public-mirror` feature | whole mirror visible to every subscriber; use consumer `#[view]`s instead for filtering/interest management |
+| **Cheap idle worlds** | leave sleeping enabled (box3d default) | none — asleep bodies skip both solver and commit; disable sleep only if you mutate resting bodies via the id-tier (no wake call yet) |
+| **Burst absorption vs latency** | `max_catchup` (we use 4) | higher = repays longer stalls in one firing (bigger tx); lower = smoother per-firing cost, drops backlog sooner |
+| **Determinism auditing** | `BOX3D_FORCE_SCALAR=1` build | ~1.7× slower stepping; scalar and SIMD are bit-identical, so this is for isolating suspicion, not correctness |
+
+Rule of thumb: start Mirrored + paced everywhere; flip worlds to Ephemeral when their state
+genuinely doesn't need to outlive a crash — that single switch buys back the entire mirror cost
+(measured: ephemeral ≡ raw box3d within noise at every body count).
 
 ## Configuration
 
