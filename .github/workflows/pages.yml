@@ -1,0 +1,52 @@
+name: Deploy sandbox-client to GitHub Pages
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'examples/sandbox-client/**'
+  workflow_dispatch:
+
+permissions:
+  pages: write
+  id-token: write
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: examples/sandbox-client/package-lock.json
+
+      - name: Install dependencies
+        working-directory: examples/sandbox-client
+        run: npm ci
+
+      - name: Build
+        working-directory: examples/sandbox-client
+        run: npm run build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: examples/sandbox-client/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

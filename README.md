@@ -27,12 +27,12 @@ crate-type = ["cdylib"]
 [dependencies]
 spacetimedb = "2.6"
 box3d = "0.1.14"
-box3d-stdb = { git = "https://github.com/suirad/box3d-stdb", tag = "v0.1.14-r1" }
+box3d-stdb = { git = "https://github.com/suirad/box3d-stdb", tag = "v0.1.14-r2" }
 
 # Reroute the wrapper's box3d-sys to the wasm-ready build in this repo.
 # Cargo only honors [patch] in the workspace root manifest. Pin the same tag.
 [patch.crates-io]
-box3d-sys = { git = "https://github.com/suirad/box3d-stdb", tag = "v0.1.14-r1" }
+box3d-sys = { git = "https://github.com/suirad/box3d-stdb", tag = "v0.1.14-r2" }
 ```
 
 > **Why git, not crates.io:** the drop-in `box3d-sys` must carry the exact upstream package name
@@ -79,6 +79,26 @@ constructive — shapes, densities, joints, and any runtime changes to them — 
 in your own tables and re-apply in `rebuild_fn`, exactly like spawns. Joints are raw-API
 (`w.world()` + `JointId`); their force-threshold events arrive in
 `StepResult.events.joint_overloads` for breakage logic.
+
+### Gameplay queries & forces
+
+Inside any `with_world`/`with_world_paced` closure, `WorldCtx` exposes a keyed query/dynamics tier
+so game code never has to touch raw ids:
+
+- `cast_ray_closest(origin, translation) -> Option<KeyedRayHit>` — closest ray hit, with the struck
+  shape already resolved to its consumer body key (the upstream wrapper drops that mapping). Aim +
+  shoot in two lines: cast, then impulse the returned key.
+- `apply_impulse` / `apply_impulse_to_center`, `apply_force` / `apply_force_to_center`,
+  `apply_torque`, `apply_angular_impulse` — one-shot and continuous forces (linear and angular) by
+  key. All wake the body first (box3d ignores forces on a sleeper), so you never get a silent no-op.
+- `linear_velocity(key)` / `angular_velocity(key)` / `mass(key)` — the id tier exposes none of
+  these; read them straight from the solver. `mass` scales an impulse to a target launch speed
+  (`impulse = mass * velocity`).
+- `overlap_sphere(center, radius) -> Vec<u64>` — every glue-spawned body overlapping the sphere,
+  deduped, for AOE/proximity logic.
+
+`examples/sandbox-module` drives all of these (raycast shooting, per-body impulses, a pit sensor),
+and `examples/sandbox-client` renders it in the browser.
 
 ### Realtime pacing
 
@@ -148,6 +168,11 @@ These crates are **wasm-only** — native builds fail fast with a pointer to ups
   bench reducers, and a 10-assertion C-heap leak suite (every error path frees to exact baseline;
   a poisoned world leaks exactly one world's allocations by design — torn C state is never
   destroyed).
+- `examples/sandbox-module` + `examples/sandbox-client` — a multiplayer physics sandbox: spawn
+  boxes/balls, shoot them with raycast impulses, score bodies falling into a pit sensor. The
+  module shows the gameplay helper tier (`cast_ray_closest`, `apply_impulse`, sensor events) and
+  presence-gated ticking; the client is a vanilla three.js page (GitHub Pages-ready via
+  `.github/workflows/pages.yml`) subscribed straight to the `public-mirror` table.
 
 ## How it works
 
@@ -167,9 +192,11 @@ These crates are **wasm-only** — native builds fail fast with a pointer to ups
   fetch it automatically).
 - `crates/box3d-stdb` — re-exports `box3d` plus the persistence layer: `with_world` (generation
   guard, poison handling, post-step delta commit), `WorldCtx` mutators (`spawn`/`destroy`/
-  `set_transform`/`wake` keep the C world and the mirror consistent in one call), the `b3_world`/`b3_body`
-  tables, and `StepResult` events. Also `install_box3d_logging()` — call once from your `init`
-  reducer to route box3d's internal warnings (`b3Log`) to the module log.
+  `set_transform`/`wake` keep the C world and the mirror consistent in one call), the keyed
+  gameplay tier (`cast_ray_closest`/`apply_impulse`/`apply_force`/`overlap_sphere`/velocity
+  getters — see *Gameplay queries & forces*), the `b3_world`/`b3_body` tables, and `StepResult`
+  events. Also `install_box3d_logging()` — call once from your `init` reducer to route box3d's
+  internal warnings (`b3Log`) to the module log.
 
 ## Releasing
 

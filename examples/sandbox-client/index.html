@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>box3d sandbox</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body { overflow: hidden; background: #1a1a2e; }
+      canvas { display: block; }
+      #toolbar {
+        position: fixed;
+        top: 12px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        gap: 8px;
+        z-index: 10;
+      }
+      #toolbar button {
+        padding: 6px 14px;
+        background: #2a2a4e;
+        color: #ccd;
+        border: 1px solid #446;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 13px;
+      }
+      #toolbar button:hover { background: #3a3a6e; }
+      #hud {
+        position: fixed;
+        bottom: 12px;
+        left: 12px;
+        color: #aabbcc;
+        font-family: monospace;
+        font-size: 13px;
+        background: rgba(0, 0, 0, 0.5);
+        padding: 6px 10px;
+        border-radius: 4px;
+        z-index: 10;
+        pointer-events: auto; /* capture clicks so the info link works and the text is selectable */
+        user-select: text;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="toolbar"></div>
+    <div id="hud">connecting…</div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

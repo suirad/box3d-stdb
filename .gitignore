@@ -1,3 +1,6 @@
 target
 .design/
 .plan/
+
+# Local-only throwaway tooling, kept for reuse but not part of the project.
+/examples/energy-probe/

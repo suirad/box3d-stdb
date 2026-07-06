@@ -3,7 +3,25 @@
 All notable changes to this project. Versions track the upstream `box3d`/`box3d-sys` releases
 they build on (see README maintenance policy).
 
-## [Unreleased] — 0.1.14 line
+## [Unreleased]
+
+## v0.1.14-r2 — 2026-07-06
+
+### Gameplay helpers
+
+- `WorldCtx` game-query/dynamics tier: `cast_ray_closest` → `KeyedRayHit` (closest hit resolved
+  to a consumer body key — the upstream wrapper drops the shape id on this path), linear
+  impulses/forces at a point or center of mass, torque, angular impulse, linear/angular velocity
+  getters, `mass`, and `overlap_sphere` (deduped body keys). All mutators wake the body: box3d
+  silently ignores forces on sleepers.
+- `examples/sandbox-module` + `examples/sandbox-client` — multiplayer sandbox showcase: raycast
+  shooting, per-body impulses, pit-sensor scoring with a height backstop, presence-gated 60 Hz
+  ticking (first connection starts the timer, last one out stops it — a maincloud-energy saver),
+  body cap; vanilla three.js client on the `public-mirror` table with a GitHub Pages deploy
+  workflow and a live per-body energy-cost estimate. Gotcha the module encodes: box3d sensors
+  only report visitor shapes that set `enable_sensor_events` themselves.
+
+## v0.1.14-r1 — 2026-07-04
 
 ### Foundation
 

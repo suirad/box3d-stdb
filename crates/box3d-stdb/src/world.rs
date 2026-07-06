@@ -151,6 +151,18 @@ pub struct PacedResult<R> {
     pub steps_run: u32,
 }
 
+/// A ray hit from [`WorldCtx::cast_ray_closest`], with the struck shape resolved to its body key.
+///
+/// `body_key` is `None` when the ray hit a body not spawned through the glue (raw-created, so it
+/// has no mirror key) — the geometry (`point`/`normal`/`fraction`) is still valid, only the key
+/// mapping is absent. `fraction` is the hit distance along `translation`, in `0.0..=1.0`.
+pub struct KeyedRayHit {
+    pub body_key: Option<u64>,
+    pub point: Vec3,
+    pub normal: Vec3,
+    pub fraction: f32,
+}
+
 struct WorldSlot {
     world: box3d::World,
     keys: HashMap<u64, u64>,     // consumer body_key → BodyId::to_bits()
@@ -326,6 +338,172 @@ impl WorldCtx<'_> {
             self.ctx.db.b3_body().body_key().update(row);
         }
         Ok(())
+    }
+
+    /// Cast a ray from `origin` along `translation` (its direction *and* length) and return the
+    /// closest hit, or `None` if the ray reached its end without striking anything.
+    ///
+    /// The hit shape is resolved to its owning body key; see [`KeyedRayHit`] for what a `None`
+    /// `body_key` means. Uses box3d's default query filter (every category is hittable).
+    pub fn cast_ray_closest(&self, origin: Vec3, translation: Vec3) -> Option<KeyedRayHit> {
+        let filter = unsafe { sys::b3DefaultQueryFilter() };
+        let result = unsafe {
+            sys::b3World_CastRayClosest(
+                world_raw(self.world),
+                origin.into(),
+                translation.into(),
+                filter,
+            )
+        };
+        // Upstream contract: "if hit is false, all other data is invalid" — bail before shapeId.
+        if !result.hit {
+            return None;
+        }
+        Some(KeyedRayHit {
+            body_key: shape_body_key(self.keys_rev, shape_bits(result.shapeId)),
+            point: result.point.into(),
+            normal: result.normal.into(),
+            fraction: result.fraction,
+        })
+    }
+
+    /// Apply a world-space linear impulse at a world-space `point`. Err on unknown key.
+    ///
+    /// Wakes the body: a sleeping body silently ignores impulses, so passing `false` would make the
+    /// call a no-op exactly when a reaction is expected (same rationale as `wake`).
+    pub fn apply_impulse(&mut self, key: u64, impulse: Vec3, point: Vec3) -> Result<(), String> {
+        let bits = *self
+            .keys
+            .get(&key)
+            .ok_or_else(|| format!("box3d-stdb: unknown body key {key}"))?;
+        unsafe { sys::b3Body_ApplyLinearImpulse(body_raw(bits), impulse.into(), point.into(), true) };
+        Ok(())
+    }
+
+    /// Apply a world-space linear impulse at the body's center of mass (no induced spin). Err on
+    /// unknown key. Wakes the body, for the reason given on [`WorldCtx::apply_impulse`].
+    pub fn apply_impulse_to_center(&mut self, key: u64, impulse: Vec3) -> Result<(), String> {
+        let bits = *self
+            .keys
+            .get(&key)
+            .ok_or_else(|| format!("box3d-stdb: unknown body key {key}"))?;
+        unsafe { sys::b3Body_ApplyLinearImpulseToCenter(body_raw(bits), impulse.into(), true) };
+        Ok(())
+    }
+
+    /// Apply a continuous world-space force at a world-space `point`, integrated over the next
+    /// step's `dt`. Err on unknown key. Wakes the body ([`WorldCtx::apply_impulse`]).
+    pub fn apply_force(&mut self, key: u64, force: Vec3, point: Vec3) -> Result<(), String> {
+        let bits = *self
+            .keys
+            .get(&key)
+            .ok_or_else(|| format!("box3d-stdb: unknown body key {key}"))?;
+        unsafe { sys::b3Body_ApplyForce(body_raw(bits), force.into(), point.into(), true) };
+        Ok(())
+    }
+
+    /// Apply a continuous world-space force at the body's center of mass (no induced spin),
+    /// integrated over the next step's `dt`. Err on unknown key. Wakes the body.
+    pub fn apply_force_to_center(&mut self, key: u64, force: Vec3) -> Result<(), String> {
+        let bits = *self
+            .keys
+            .get(&key)
+            .ok_or_else(|| format!("box3d-stdb: unknown body key {key}"))?;
+        unsafe { sys::b3Body_ApplyForceToCenter(body_raw(bits), force.into(), true) };
+        Ok(())
+    }
+
+    /// Apply a continuous world-space torque, integrated over the next step's `dt`. Err on unknown
+    /// key. Wakes the body.
+    pub fn apply_torque(&mut self, key: u64, torque: Vec3) -> Result<(), String> {
+        let bits = *self
+            .keys
+            .get(&key)
+            .ok_or_else(|| format!("box3d-stdb: unknown body key {key}"))?;
+        unsafe { sys::b3Body_ApplyTorque(body_raw(bits), torque.into(), true) };
+        Ok(())
+    }
+
+    /// Apply a one-shot world-space angular impulse (immediate spin change). Err on unknown key.
+    /// Wakes the body, for the reason given on [`WorldCtx::apply_impulse`].
+    pub fn apply_angular_impulse(&mut self, key: u64, impulse: Vec3) -> Result<(), String> {
+        let bits = *self
+            .keys
+            .get(&key)
+            .ok_or_else(|| format!("box3d-stdb: unknown body key {key}"))?;
+        unsafe { sys::b3Body_ApplyAngularImpulse(body_raw(bits), impulse.into(), true) };
+        Ok(())
+    }
+
+    /// The body's mass in kilograms. Err on unknown key. Handy for scaling an impulse to a target
+    /// launch speed (`impulse = mass * velocity`).
+    pub fn mass(&self, key: u64) -> Result<f32, String> {
+        let bits = *self
+            .keys
+            .get(&key)
+            .ok_or_else(|| format!("box3d-stdb: unknown body key {key}"))?;
+        Ok(unsafe { sys::b3Body_GetMass(body_raw(bits)) })
+    }
+
+    /// The body's current world-space linear velocity. Err on unknown key.
+    ///
+    /// The wrapper's id tier exposes no velocity getter, hence this raw-sys read (the same reason
+    /// the post-step loop reaches through `sys` for velocities).
+    pub fn linear_velocity(&self, key: u64) -> Result<Vec3, String> {
+        let bits = *self
+            .keys
+            .get(&key)
+            .ok_or_else(|| format!("box3d-stdb: unknown body key {key}"))?;
+        Ok(unsafe { sys::b3Body_GetLinearVelocity(body_raw(bits)) }.into())
+    }
+
+    /// The body's current world-space angular velocity (axis * radians/sec). Err on unknown key.
+    /// Raw-sys read for the same reason as [`WorldCtx::linear_velocity`].
+    pub fn angular_velocity(&self, key: u64) -> Result<Vec3, String> {
+        let bits = *self
+            .keys
+            .get(&key)
+            .ok_or_else(|| format!("box3d-stdb: unknown body key {key}"))?;
+        Ok(unsafe { sys::b3Body_GetAngularVelocity(body_raw(bits)) }.into())
+    }
+
+    /// Every glue-spawned body with at least one shape overlapping the sphere at `center` of
+    /// `radius`.
+    ///
+    /// Keys are deduped: box3d yields one result per overlapping *shape*, so a multi-shape body
+    /// would otherwise appear once per shape. Bodies not spawned through the glue (no mirror key)
+    /// are dropped — the returned keys are exactly the ones the caller can act on. Order is the
+    /// query's traversal order, not stable across steps.
+    pub fn overlap_sphere(&self, center: Vec3, radius: f32) -> Vec<u64> {
+        // Proxy points are relative to the `origin` arg, so a single (0,0,0) point + radius is a
+        // sphere centered on `center`.
+        let point: sys::b3Vec3 = Vec3::default().into();
+        let proxy = sys::b3ShapeProxy {
+            points: &point as *const sys::b3Vec3,
+            count: 1,
+            radius,
+        };
+        let filter = unsafe { sys::b3DefaultQueryFilter() };
+        let mut shapes: Vec<sys::b3ShapeId> = Vec::new();
+        unsafe {
+            sys::b3World_OverlapShape(
+                world_raw(self.world),
+                center.into(),
+                &proxy,
+                filter,
+                Some(overlap_collect),
+                (&mut shapes as *mut Vec<sys::b3ShapeId>).cast::<core::ffi::c_void>(),
+            )
+        };
+        let mut keys: Vec<u64> = Vec::new();
+        for s in shapes {
+            if let Some(k) = shape_body_key(self.keys_rev, shape_bits(s)) {
+                if !keys.contains(&k) {
+                    keys.push(k);
+                }
+            }
+        }
+        keys
     }
 }
 
@@ -794,6 +972,16 @@ fn body_raw(bits: u64) -> sys::b3BodyId {
     }
 }
 
+// Queries take the raw world id; the wrapper hides it, so reconstruct from World::id()'s stable
+// to_bits() layout (index1 in the high 16, generation in the low 16) — same trick as body_raw.
+fn world_raw(world: &box3d::World) -> sys::b3WorldId {
+    let bits = world.id().to_bits();
+    sys::b3WorldId {
+        index1: (bits >> 16) as u16,
+        generation: bits as u16,
+    }
+}
+
 fn shape_body_key(keys_rev: &HashMap<u64, u64>, shape_bits: u64) -> Option<u64> {
     let raw = sys::b3ShapeId {
         index1: (shape_bits >> 32) as i32,
@@ -808,6 +996,24 @@ fn shape_body_key(keys_rev: &HashMap<u64, u64>, shape_bits: u64) -> Option<u64> 
     let body = unsafe { sys::b3Shape_GetBody(raw) };
     let bits = ((body.index1 as u64) << 32) | ((body.world0 as u64) << 16) | body.generation as u64;
     keys_rev.get(&bits).copied()
+}
+
+// Pack a raw shape id into the u64 layout shape_body_key expects (mirrors ShapeId::to_bits). The
+// event path gets these bits from the wrapper's to_bits(); query results hand back raw ids instead.
+fn shape_bits(s: sys::b3ShapeId) -> u64 {
+    ((s.index1 as u64) << 32) | ((s.world0 as u64) << 16) | s.generation as u64
+}
+
+// Trampoline for b3World_OverlapShape: pushes each overlapping shape id into the Vec behind
+// `context`. Returning true keeps the query collecting every overlap rather than stopping at the
+// first. The push is caught: a panic unwinding across this C frame would be UB, so swallow it
+// (the query then just yields fewer keys) — same guard the box3d wrapper's own callbacks use.
+unsafe extern "C" fn overlap_collect(shape_id: sys::b3ShapeId, context: *mut core::ffi::c_void) -> bool {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let out = unsafe { &mut *context.cast::<Vec<sys::b3ShapeId>>() };
+        out.push(shape_id);
+    }));
+    true
 }
 
 fn touch(keys_rev: &HashMap<u64, u64>, shape_a_bits: u64, shape_b_bits: u64) -> ContactTouch {

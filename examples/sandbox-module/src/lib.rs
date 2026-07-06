@@ -1,0 +1,403 @@
+//! Shared physics sandbox for `box3d-stdb`: spawn boxes and balls, shoot them with raycasts,
+//! and watch them fall into the pit sensor for score.
+//!
+//! - `spawn_body(kind, x, y)` — drop a box (kind=0) or ball (kind=1) into the arena (≤64 bodies).
+//! - `shoot(ox,oy,oz, dx,dy,dz)` — fire a ray; hits a dynamic body (key ≥ 100) → linear impulse.
+//! - `launch(kind, ox,oy,oz, dx,dy,dz)` — spawn a body at origin+dir and fling it along `dir`.
+//! - Bodies that fall below the arena (into the pit sensor) are despawned next tick; `score.pit_count` increments.
+//! - Arena and score persist between sessions; `teardown_world` resets everything.
+//!
+//! Try it:
+//!   spacetime publish box3d-sandbox
+//!   spacetime call <db> spawn_body '[0, 0.0, 0.0]'
+//!   spacetime call <db> shoot '[0.0, -10.0, 2.0, 0.0, 1.0, -0.5]'
+//!   spacetime call <db> launch '[1, 5.0, -12.0, 2.0, 0.0, 1.0, 0.0]'
+//!   spacetime call <db> teardown_world '[]'
+
+use box3d::{BodyDef, Quat, ShapeDef, Vec3};
+// Brings `.b3_world()` into scope on the db handle — needed to check world presence in reducers.
+use box3d_stdb::b3_world;
+use spacetimedb::{ConnectionId, ReducerContext, ScheduleAt, Table, TimeDuration};
+
+const WORLD_KEY: u64 = 1;
+const DT: f32 = 1.0 / 60.0;
+const SUBSTEPS: i32 = 4;
+const MAX_BODIES: usize = 64;
+const GROUND_KEY: u64 = 1;
+const PIT_KEY: u64 = 2;
+// Height backstop: any body below this is despawned regardless of the sensor — a hard launch can
+// arc past the sensor, and a body restored below it on a rebuild never re-enters it from above.
+const KILL_Z: f32 = -25.0;
+// Action strengths — surfaced to clients via the `tuning` row so a HUD never hardcodes them.
+const SHOOT_IMPULSE: f32 = 50.0;
+const LAUNCH_SPEED: f32 = 50.0;
+
+// ── Tables ────────────────────────────────────────────────────────────────────
+
+/// Render metadata per body. Transform/velocity lives in the public `b3_body` mirror.
+#[spacetimedb::table(accessor = game_body, public)]
+pub struct GameBody {
+    #[primary_key]
+    pub body_key: u64,
+    pub kind: u8, // 0=box, 1=ball
+    pub half: f32,
+}
+
+#[spacetimedb::table(accessor = score, public)]
+pub struct Score {
+    #[primary_key]
+    pub id: u8,
+    pub pit_count: u64,
+}
+
+/// Single-row readout of the action strengths, so clients display the live values.
+#[spacetimedb::table(accessor = tuning, public)]
+pub struct Tuning {
+    #[primary_key]
+    pub id: u8,
+    pub shoot_impulse: f32,
+    pub launch_speed: f32,
+}
+
+#[spacetimedb::table(accessor = pending_despawn)]
+pub struct PendingDespawn {
+    #[primary_key]
+    pub body_key: u64,
+}
+
+/// One row per live connection (not identity — the same player may open several tabs). Public so
+/// clients can show the live user count.
+#[spacetimedb::table(accessor = connected, public)]
+pub struct Connected {
+    #[primary_key]
+    pub connection: ConnectionId,
+}
+
+#[spacetimedb::table(accessor = body_key_gen)]
+pub struct BodyKeyGen {
+    #[primary_key]
+    pub id: u8,
+    pub next: u64, // dynamic body keys start at 100; static reserved: 1=ground, 2=pit
+}
+
+#[spacetimedb::table(accessor = tick_timer, scheduled(tick))]
+pub struct TickTimer {
+    #[primary_key]
+    #[auto_inc]
+    pub scheduled_id: u64,
+    pub scheduled_at: ScheduleAt,
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn alloc_key(ctx: &ReducerContext) -> Result<u64, String> {
+    let mut gen = ctx
+        .db
+        .body_key_gen()
+        .id()
+        .find(0)
+        .ok_or("body_key_gen missing — was init called?")?;
+    let key = gen.next;
+    gen.next += 1;
+    ctx.db.body_key_gen().id().update(gen);
+    Ok(key)
+}
+
+fn normalize_or_err(dx: f32, dy: f32, dz: f32) -> Result<Vec3, String> {
+    let len = (dx * dx + dy * dy + dz * dz).sqrt();
+    if !len.is_finite() || len < f32::EPSILON {
+        return Err("direction must be non-zero and finite".into());
+    }
+    Ok(Vec3::new(dx / len, dy / len, dz / len))
+}
+
+// box3d::Vec3 has no Mul<f32>.
+fn scale(v: Vec3, s: f32) -> Vec3 {
+    Vec3::new(v.x * s, v.y * s, v.z * s)
+}
+
+/// Attach the dynamic shape for `kind`. Visitor shapes must opt into sensor events too —
+/// the pit sensor reports nothing for bodies that don't.
+fn attach_shape(body: box3d::BodyId, kind: u8, half: f32) {
+    let def = ShapeDef {
+        density: 1.0,
+        enable_sensor_events: true,
+        ..ShapeDef::default()
+    };
+    if kind == 0 {
+        body.create_box(Vec3::new(half, half, half), def);
+    } else {
+        body.create_sphere(Vec3::ZERO, half, def);
+    }
+}
+
+// ── Scene rebuild ─────────────────────────────────────────────────────────────
+
+// Two-arg so spawn_scene can read game_body without WorldCtx exposing ctx.db.
+fn spawn_scene(ctx: &ReducerContext, w: &mut box3d_stdb::WorldCtx<'_>) -> Result<(), String> {
+    // Ground: top face at z=0.
+    let ground = w.spawn(GROUND_KEY, BodyDef::static_at(Vec3::new(0.0, 0.0, -1.0)))?;
+    ground.create_box(Vec3::new(15.0, 15.0, 1.0), ShapeDef::default());
+
+    // Pit sensor just below the platform — demonstrates sensor events for bodies that fall straight
+    // off the edge. The KILL_Z height check in `tick` is the real guarantee; this only has to catch
+    // the common case, so it stays a sane size (a giant sensor bloats the broadphase and still can't
+    // catch a body already below it).
+    let pit = w.spawn(PIT_KEY, BodyDef::static_at(Vec3::new(0.0, 0.0, -8.0)))?;
+    pit.create_box(
+        Vec3::new(100.0, 100.0, 2.0),
+        ShapeDef {
+            is_sensor: true,
+            enable_sensor_events: true,
+            ..ShapeDef::default()
+        },
+    );
+
+    // Sorted ascending: the solver is creation-order sensitive and table iter order is no contract.
+    let mut bodies: Vec<(u64, u8, f32)> = ctx
+        .db
+        .game_body()
+        .iter()
+        .map(|r| (r.body_key, r.kind, r.half))
+        .collect();
+    bodies.sort_by_key(|&(k, _, _)| k);
+
+    for (key, kind, half) in bodies {
+        let body = w.spawn(key, BodyDef::dynamic_at(Vec3::new(0.0, 0.0, 3.0)))?;
+        attach_shape(body, kind, half);
+    }
+    Ok(())
+}
+
+// ── Lifecycle ─────────────────────────────────────────────────────────────────
+
+#[spacetimedb::reducer(init)]
+pub fn init(ctx: &ReducerContext) {
+    box3d_stdb::install_box3d_logging();
+    if ctx.db.score().id().find(0).is_none() {
+        ctx.db.score().insert(Score { id: 0, pit_count: 0 });
+    }
+    if ctx.db.body_key_gen().id().find(0).is_none() {
+        ctx.db.body_key_gen().insert(BodyKeyGen { id: 0, next: 100 });
+    }
+    if ctx.db.tuning().id().find(0).is_none() {
+        ctx.db.tuning().insert(Tuning {
+            id: 0,
+            shoot_impulse: SHOOT_IMPULSE,
+            launch_speed: LAUNCH_SPEED,
+        });
+    }
+}
+
+#[spacetimedb::reducer(client_connected)]
+pub fn client_connected(ctx: &ReducerContext) -> Result<(), String> {
+    let connection = ctx
+        .connection_id()
+        .ok_or("client_connected without a connection id")?;
+    ctx.db.connected().insert(Connected { connection });
+    // First visitor: boot the world and start ticking.
+    if ctx.db.b3_world().world_key().find(WORLD_KEY).is_none() {
+        box3d_stdb::create_world(ctx, WORLD_KEY, &box3d_stdb::WorldDef::default())?;
+    }
+    if ctx.db.tick_timer().iter().next().is_none() {
+        ctx.db.tick_timer().insert(TickTimer {
+            scheduled_id: 0,
+            scheduled_at: ScheduleAt::Interval(TimeDuration::from_micros(16_667)),
+        });
+    }
+    Ok(())
+}
+
+#[spacetimedb::reducer(client_disconnected)]
+pub fn client_disconnected(ctx: &ReducerContext) -> Result<(), String> {
+    if let Some(connection) = ctx.connection_id() {
+        ctx.db.connected().connection().delete(connection);
+    }
+    // Last player out: pause ticking. World + mirror persist for the next visitor.
+    if ctx.db.connected().iter().next().is_none() {
+        let ids: Vec<u64> = ctx.db.tick_timer().iter().map(|t| t.scheduled_id).collect();
+        for id in ids {
+            ctx.db.tick_timer().scheduled_id().delete(id);
+        }
+    }
+    Ok(())
+}
+
+// ── Scheduled step ────────────────────────────────────────────────────────────
+
+#[spacetimedb::reducer]
+pub fn tick(ctx: &ReducerContext, _timer: TickTimer) -> Result<(), String> {
+    if ctx.sender() != ctx.database_identity() {
+        return Err("tick may only be called by the scheduler".into());
+    }
+    let res = box3d_stdb::with_world_paced(
+        ctx,
+        WORLD_KEY,
+        DT,
+        SUBSTEPS,
+        4,
+        |w| spawn_scene(ctx, w),
+        |w| {
+            // Drain deferred despawns queued by the previous tick's pit events.
+            let to_despawn: Vec<u64> =
+                ctx.db.pending_despawn().iter().map(|r| r.body_key).collect();
+            for key in to_despawn {
+                // Tolerate unknown-key error — body may have already been removed.
+                let _ = w.destroy(key);
+                ctx.db.game_body().body_key().delete(key);
+                ctx.db.pending_despawn().body_key().delete(key);
+            }
+            Ok(())
+        },
+    )?;
+
+    // Both triggers despawn next tick (so this tick's mirror commit lands first) and dedupe on the
+    // pending row, so a body caught by both the sensor and the height check only scores once.
+    // Sensor: bodies that fell straight off the platform edge.
+    for ev in &res.events.sensor_begins {
+        // Glue contract: sensor→body_key_a, visitor→body_key_b.
+        if ev.body_key_a == Some(PIT_KEY) {
+            if let Some(k) = ev.body_key_b {
+                queue_kill(ctx, k);
+            }
+        }
+    }
+    // Height backstop: anything that arced past the sensor or was restored below it is still
+    // falling — and thus in the move events — so catch it by z.
+    for m in &res.events.moves {
+        if m.position.2 < KILL_Z {
+            queue_kill(ctx, m.body_key);
+        }
+    }
+    Ok(())
+}
+
+/// Queue body `k` for despawn next tick and score it, once. Ignores non-dynamic keys.
+fn queue_kill(ctx: &ReducerContext, k: u64) {
+    if k < 100 || ctx.db.pending_despawn().body_key().find(k).is_some() {
+        return;
+    }
+    ctx.db.pending_despawn().insert(PendingDespawn { body_key: k });
+    if let Some(mut s) = ctx.db.score().id().find(0) {
+        s.pit_count += 1;
+        ctx.db.score().id().update(s);
+    }
+}
+
+// ── Game reducers ─────────────────────────────────────────────────────────────
+
+/// Drop a box (kind=0) or ball (kind=1) at (x, y, 3.0). Max 64 bodies.
+#[spacetimedb::reducer]
+pub fn spawn_body(ctx: &ReducerContext, kind: u8, x: f32, y: f32) -> Result<(), String> {
+    if kind > 1 {
+        return Err(format!("invalid kind {kind}; 0=box 1=ball"));
+    }
+    if ctx.db.game_body().iter().count() >= MAX_BODIES {
+        return Err("arena full".into());
+    }
+    let x = x.clamp(-14.0, 14.0);
+    let y = y.clamp(-14.0, 14.0);
+    let half = 0.5_f32;
+    let key = alloc_key(ctx)?;
+    ctx.db.game_body().insert(GameBody { body_key: key, kind, half });
+    box3d_stdb::with_world(ctx, WORLD_KEY, DT, SUBSTEPS, |w| spawn_scene(ctx, w), |w| {
+        if w.body_id(key).is_none() {
+            let body = w.spawn(key, BodyDef::dynamic_at(Vec3::new(x, y, 3.0)))?;
+            attach_shape(body, kind, half);
+        } else {
+            // Cold rebuild already respawned this key at the nominal drop point; move it to the
+            // requested spot. Unknown-key is impossible here, so the error is safe to drop.
+            let _ = w.set_transform(key, Vec3::new(x, y, 3.0), Quat { v: Vec3::ZERO, s: 1.0 });
+        }
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+/// Fire a ray; on closest hit with a dynamic body (key ≥ 100), apply a linear impulse.
+#[spacetimedb::reducer]
+pub fn shoot(
+    ctx: &ReducerContext,
+    ox: f32,
+    oy: f32,
+    oz: f32,
+    dx: f32,
+    dy: f32,
+    dz: f32,
+) -> Result<(), String> {
+    let dir = normalize_or_err(dx, dy, dz)?;
+    box3d_stdb::with_world(ctx, WORLD_KEY, DT, SUBSTEPS, |w| spawn_scene(ctx, w), |w| {
+        if let Some(hit) = w.cast_ray_closest(Vec3::new(ox, oy, oz), scale(dir, 100.0)) {
+            if let Some(k) = hit.body_key {
+                if k >= 100 {
+                    // Ignore error: body may have just been despawned between ray and impulse.
+                    let _ = w.apply_impulse(k, scale(dir, SHOOT_IMPULSE), hit.point);
+                }
+            }
+        }
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+/// Spawn a body at `origin + dir` (clamped to arena) and launch it along `dir` at `LAUNCH_SPEED`.
+#[allow(clippy::too_many_arguments)] // reducer protocol boundary — args can't be grouped without a SpacetimeType
+#[spacetimedb::reducer]
+pub fn launch(
+    ctx: &ReducerContext,
+    kind: u8,
+    ox: f32,
+    oy: f32,
+    oz: f32,
+    dx: f32,
+    dy: f32,
+    dz: f32,
+) -> Result<(), String> {
+    if kind > 1 {
+        return Err(format!("invalid kind {kind}; 0=box 1=ball"));
+    }
+    if ctx.db.game_body().iter().count() >= MAX_BODIES {
+        return Err("arena full".into());
+    }
+    let dir = normalize_or_err(dx, dy, dz)?;
+    let half = 0.5_f32;
+    let key = alloc_key(ctx)?;
+    ctx.db.game_body().insert(GameBody { body_key: key, kind, half });
+    let px = (ox + dir.x).clamp(-14.0, 14.0);
+    let py = (oy + dir.y).clamp(-14.0, 14.0);
+    let pz = (oz + dir.z).clamp(1.0, 10.0);
+    box3d_stdb::with_world(ctx, WORLD_KEY, DT, SUBSTEPS, |w| spawn_scene(ctx, w), |w| {
+        if w.body_id(key).is_none() {
+            let id = w.spawn(key, BodyDef::dynamic_at(Vec3::new(px, py, pz)))?;
+            attach_shape(id, kind, half);
+        } else {
+            // Cold rebuild already respawned this key at the nominal drop point; move it to the
+            // requested spot. Unknown-key is impossible here, so the error is safe to drop.
+            let _ = w.set_transform(key, Vec3::new(px, py, pz), Quat { v: Vec3::ZERO, s: 1.0 });
+        }
+        // Set velocity whether warm (just spawned) or rebuild (spawn_scene placed at default pos).
+        if let Some(id) = w.body_id(key) {
+            id.set_linear_velocity(scale(dir, LAUNCH_SPEED));
+        }
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+/// Stop ticking and destroy the world; clears all arena state. Score and key counter persist.
+#[spacetimedb::reducer]
+pub fn teardown_world(ctx: &ReducerContext) -> Result<(), String> {
+    let ids: Vec<u64> = ctx.db.tick_timer().iter().map(|t| t.scheduled_id).collect();
+    for id in ids {
+        ctx.db.tick_timer().scheduled_id().delete(id);
+    }
+    let body_keys: Vec<u64> = ctx.db.game_body().iter().map(|r| r.body_key).collect();
+    for k in body_keys {
+        ctx.db.game_body().body_key().delete(k);
+    }
+    let pending: Vec<u64> = ctx.db.pending_despawn().iter().map(|r| r.body_key).collect();
+    for k in pending {
+        ctx.db.pending_despawn().body_key().delete(k);
+    }
+    box3d_stdb::destroy_world(ctx, WORLD_KEY)
+}
