@@ -182,17 +182,26 @@ costLink.addEventListener('click', (e) => { e.preventDefault(); costModal.style.
 costModal.addEventListener('click', () => { costModal.style.display = 'none'; });
 
 // ── Toolbar ───────────────────────────────────────────────────────────────────
-const toolbar = document.getElementById('toolbar')!;
+const toolbar = document.querySelector<HTMLElement>('.toolbar-btns')!;
+const modeBtns: HTMLButtonElement[] = [];
 
 for (const m of ['Spawn', 'Shoot', 'Launch'] as Mode[]) {
   const btn = document.createElement('button');
   btn.textContent = m;
-  btn.addEventListener('click', () => { activeMode = m; refreshHUD(); });
+  btn.addEventListener('click', () => {
+    activeMode = m;
+    modeBtns.forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    refreshHUD();
+  });
   toolbar.appendChild(btn);
+  modeBtns.push(btn);
 }
+modeBtns[0].classList.add('active'); // Spawn is the default mode
 
 const kindBtn = document.createElement('button');
 kindBtn.textContent = 'Box';
+kindBtn.classList.add('active');
 kindBtn.addEventListener('click', () => {
   activeKind = activeKind === 0 ? 1 : 0;
   kindBtn.textContent = activeKind === 0 ? 'Box' : 'Ball';
