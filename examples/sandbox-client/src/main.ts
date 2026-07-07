@@ -44,6 +44,10 @@ camera.lookAt(0, 0, 0);
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 0, 0);
+// Left is reserved for the click action; orbit lives on right (rotate) + middle (pan).
+controls.mouseButtons.LEFT = null;
+controls.mouseButtons.MIDDLE = THREE.MOUSE.PAN;
+controls.mouseButtons.RIGHT = THREE.MOUSE.ROTATE;
 controls.update();
 
 scene.add(new THREE.AmbientLight(0xffffff, 0.6));
@@ -318,9 +322,10 @@ renderer.domElement.addEventListener('pointerdown', (e) => {
 });
 
 renderer.domElement.addEventListener('pointerup', (e) => {
+  if (e.button !== 0) return; // left button only — right rotates, middle pans
   const ddx = e.clientX - pdPos.x;
   const ddy = e.clientY - pdPos.y;
-  // Below 5 px / 300 ms it's a click action; anything larger belongs to OrbitControls.
+  // Below 5 px / 300 ms is a click; a larger left-drag is ignored, not an action.
   if (ddx * ddx + ddy * ddy > 25 || Date.now() - pdTime >= 300) return;
 
   const ndc = new THREE.Vector2(

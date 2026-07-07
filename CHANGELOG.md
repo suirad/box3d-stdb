@@ -5,6 +5,18 @@ they build on (see README maintenance policy).
 
 ## [Unreleased]
 
+### Procedure execution mode
+
+- The tick can run inside a SpacetimeDB `#[procedure]` instead of a scheduled reducer — for both
+  mirrored and ephemeral worlds, with no crate changes. `TxContext` (from `ctx.try_with_tx`)
+  derefs to `ReducerContext`, so `with_world`/`with_world_paced`/`create_world` accept the tx via
+  deref coercion. The generation guard stays abort-safe as long as the whole tick lives in one
+  `try_with_tx` (not `with_tx`, which commits on `Err`); the commit-conflict retry self-heals a
+  double-step via the existing generation mismatch → rebuild path. Procedures also enable a
+  scheduler-free `sleep_until` self-pacing loop.
+- `examples/procedure-demo` — the bouncing ball ticked by a `#[procedure]`, with the `sleep_until`
+  loop and a mirror `#[view]`. README gains a *Ticking from a procedure* section.
+
 ## v0.1.14-r2 — 2026-07-06
 
 ### Gameplay helpers

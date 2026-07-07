@@ -128,6 +128,44 @@ abort-safety guard still applies; a cache drop just respawns the world fresh. Pe
 come back in `StepResult.events.moves` — pipe them to a broadcast event table for clients
 (`examples/ephemeral-demo` shows the pattern). Persistence is fixed at world creation.
 
+### Ticking from a procedure
+
+A scheduled reducer is the default tick driver, but the same tick can run inside a SpacetimeDB
+`#[procedure]` — for both mirrored and ephemeral worlds, with **no crate changes**. Procedures
+aren't auto-transactional; database work runs inside `ctx.try_with_tx(|tx| …)`, and `TxContext`
+derefs to `ReducerContext`, so the whole glue API (`with_world`, `with_world_paced`,
+`create_world`) accepts `tx` directly via deref coercion:
+
+```rust
+#[spacetimedb::table(accessor = tick_timer, scheduled(tick_proc))]
+pub struct TickTimer { #[primary_key] #[auto_inc] scheduled_id: u64, scheduled_at: ScheduleAt, world_key: u64 }
+
+#[spacetimedb::procedure]
+fn tick_proc(ctx: &mut ProcedureContext, timer: TickTimer) -> Result<(), String> {
+    let wk = timer.world_key; // Copy out: try_with_tx may re-run the closure (see below)
+    ctx.try_with_tx(|tx| {
+        with_world_paced(tx, wk, 1.0 / 60.0, 4, 4, rebuild, game).map(|_| ())
+    })
+}
+```
+
+Two rules keep the generation guard as abort-safe as it is under a reducer:
+
+- **The whole guarded tick goes in one `try_with_tx`, and it must be `try_with_tx`, not `with_tx`.**
+  `try_with_tx` rolls back on `Err`, so a guard failure discards the eager generation bump and the
+  next firing rebuilds — exactly the reducer contract. `with_tx` *always* commits on return, so a
+  guard `Err` would persist a bumped generation with no matching step: the guard is defeated.
+- **Keep the closure `Fn`-safe.** `try_with_tx` re-invokes the body once if the commit hits a
+  conflict, so copy `Copy` values out first and don't move non-`Copy` captures in. A retried
+  double-step self-heals anyway (the in-memory generation runs ahead of the rolled-back durable
+  stamp → mismatch → rebuild), and a single scheduled-procedure-per-world never conflicts.
+
+Procedures also unlock a scheduler-free **self-pacing loop**: step, release the tx, `ctx.sleep_until`
+the next frame, repeat (the tx must never be held across the sleep). Reach for procedure-mode when
+the tick needs what reducers forbid — HTTP calls, `sleep_until` — otherwise a scheduled reducer is
+simpler and just as fast (the sim cost is identical; procedures only add per-firing transaction
+setup). Player actions stay reducers. `examples/procedure-demo` runs the whole pattern.
+
 ### Choosing a configuration
 
 The knobs compose — pick by what the world is for:
@@ -137,6 +175,7 @@ The knobs compose — pick by what the world is for:
 | **Max sim speed** (lobby matches, cosmetic physics) | `Persistence::Ephemeral` + `with_world_paced` | state resets to spawn on any cache drop; clients need an event-table pipe for positions |
 | **Durability** (persistent zones, resumable matches) | `Persistence::Mirrored` (default) | ~1.5–1.8× stepping while bodies are awake (0.3–0.5 µs per moving body per step; sleeping bodies are free — measured 512 asleep bodies stepping at pure call overhead) |
 | **Realtime accuracy** | `with_world_paced` on the scheduled tick (both modes) | negligible — one row field + integer math per firing |
+| **Tick needs HTTP / self-pacing** | drive the tick from a `#[procedure]` (`try_with_tx`, both modes) | per-firing transaction setup; keep the whole guarded tick in one `try_with_tx` (see *Ticking from a procedure*) |
 | **Zero-boilerplate client visibility** | `public-mirror` feature | whole mirror visible to every subscriber; use consumer `#[view]`s instead for filtering/interest management |
 | **Cheap idle worlds** | leave sleeping enabled (box3d default) | none — asleep bodies skip solver, commit, and broadcast (a settled world is measured-silent); `w.wake(key)` before mutating a resting body |
 | **Burst absorption vs latency** | `max_catchup` (we use 4) | higher = repays longer stalls in one firing (bigger tx); lower = smoother per-firing cost, drops backlog sooner |
@@ -164,6 +203,9 @@ These crates are **wasm-only** — native builds fail fast with a pointer to ups
   A ball republished mid-flight resumes its arc — position *and* velocity restored from tables.
 - `examples/ephemeral-demo` — same ball on an ephemeral world, positions broadcast through a
   SpacetimeDB event table (rows are never stored; clients receive `onInsert` only).
+- `examples/procedure-demo` — the same ball, but the 60 Hz tick runs in a `#[procedure]`
+  (`try_with_tx` + `with_world_paced`) instead of a scheduled reducer, plus a `sleep_until`
+  self-pacing loop. See *Ticking from a procedure*.
 - `examples/test-module` + `scripts/test-c-mem.fish` — guard/mirror/poison probes, settle and
   bench reducers, and a 10-assertion C-heap leak suite (every error path frees to exact baseline;
   a poisoned world leaks exactly one world's allocations by design — torn C state is never
@@ -173,6 +215,49 @@ These crates are **wasm-only** — native builds fail fast with a pointer to ups
   module shows the gameplay helper tier (`cast_ray_closest`, `apply_impulse`, sensor events) and
   presence-gated ticking; the client is a vanilla three.js page (GitHub Pages-ready via
   `.github/workflows/pages.yml`) subscribed straight to the `public-mirror` table.
+
+## Static memory, and why it's safe here
+
+Live `b3World` objects are C allocations in the module's **wasm linear memory**, held in a fixed
+static array (`BOX3D_MAX_WORLDS` slots, default 1024) indexed by world key. Reaching for a static
+array like this inside a SpacetimeDB module is normally a latent bug — linear memory sits outside
+the transactional datastore and outside every durability guarantee:
+
+- **A reducer abort rolls back your tables but not linear memory.** A panic partway through a
+  mutation leaves the C world half-changed while the tables it was meant to match snap back — the
+  two silently disagree.
+- **Instance memory doesn't survive a republish or restart** — a fresh wasm instance starts with
+  the static array zeroed.
+- **The host may relocate your module between machines or regions.** On Maincloud an instance
+  isn't pinned; a move spins up a fresh instance elsewhere with empty linear memory, and nothing
+  carries the old array across. Code that trusted the static array would read state that simply
+  isn't there — with no signal that it moved.
+
+So the static array is treated as a **cache that is never authoritative**. The durable record
+lives in tables, and every entry into `with_world` re-earns the right to use the cache:
+
+- **Generation stamp (the `b3_world` metadata table).** Each world's durable row carries a
+  generation counter alongside its `WorldDef`, tick, and pacing accumulator. A cache slot
+  remembers the generation it was built at; on entry the glue compares it to the durable stamp and
+  **bumps the stamp eagerly, before stepping**. A cold instance (region move, restart, republish)
+  has an empty slot → mismatch → rebuild. An aborted tick rolls the table bump back but *not* the
+  in-memory bump, so the next call sees a mismatch → rebuild. Every loss-of-trust path — panic,
+  abort, republish, restart, cold start, migration — converges on the same behavior: discard the
+  cache, rebuild from tables.
+- **Poison discipline.** A world that may have been torn mid-mutation is *abandoned*
+  (`mem::forget`), never handed to `b3DestroyWorld` — destroying torn C state through the
+  module-global allocator is UB. The leak is bounded and measured (exactly one empty world ≈ 164
+  KB per poison event; every non-poison error path frees the C heap back to exact baseline, gated
+  by the leak-suite test). The poisoned slot is dropped and the next call rebuilds clean.
+- **Rebuild from the mirror.** `b3_body` holds each body's transform, velocity, and sleep flag,
+  delta-committed after every step. A rebuild replays your constructive state (shapes/joints, via
+  `rebuild_fn`) and overlays these rows, so a world reconstructed on a brand-new instance resumes
+  where it left off — a ball republished mid-flight keeps its arc.
+
+The net effect: the static array only ever accelerates the common case. It is validated against a
+durable stamp on *every* tick and discarded the instant that stamp disagrees, so the UB-prone
+pattern — authoritative static memory in a relocatable cloud module — never actually occurs. The
+tables are the truth; the cache is disposable by construction.
 
 ## How it works
 
