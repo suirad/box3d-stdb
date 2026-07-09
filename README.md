@@ -3,6 +3,10 @@
 [box3d](https://github.com/erincatto/box3d) (3D rigid-body physics, C) built for
 [SpacetimeDB](https://spacetimedb.com) server modules (`wasm32-unknown-unknown`).
 
+**[API docs](https://suirad.github.io/box3d-stdb/docs/)** ·
+[live sandbox demo](https://suirad.github.io/box3d-stdb/) — rustdoc is self-hosted on Pages
+because a `[patch.crates-io]` crate can't publish to crates.io, so docs.rs can't build it.
+
 The published [`box3d`](https://crates.io/crates/box3d) wrapper crate can't run inside a
 SpacetimeDB module: its `box3d-sys` builds the C library with cmake (which doesn't cross-compile to
 bare wasm) and the target has no libc, no allocator, and no libm. This repo provides a **drop-in

@@ -1,10 +1,12 @@
-name: Deploy sandbox-client to GitHub Pages
+name: Deploy sandbox-client + API docs to GitHub Pages
 
 on:
   push:
     branches: [master]
     paths:
       - 'examples/sandbox-client/**'
+      - 'crates/**'
+      - '.github/workflows/pages.yml'
   workflow_dispatch:
 
 permissions:
@@ -21,6 +23,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # box3d-sys's build script compiles the vendored C — cargo doc runs build scripts.
+          submodules: recursive
 
       - uses: actions/setup-node@v4
         with:
@@ -35,6 +40,21 @@ jobs:
       - name: Build
         working-directory: examples/sandbox-client
         run: npm run build
+
+      # docs.rs can't build this repo (git-only patch crate; the crates.io box3d-sys it would
+      # pull cannot compile for wasm), so rustdoc is self-hosted under /docs on the same site.
+      - name: Build API docs
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo doc --no-deps -p box3d-stdb --target wasm32-unknown-unknown
+
+      - name: Merge docs into site
+        run: |
+          mkdir -p examples/sandbox-client/dist/docs
+          cp -r target/wasm32-unknown-unknown/doc/* examples/sandbox-client/dist/docs/
+          cat > examples/sandbox-client/dist/docs/index.html <<'EOF'
+          <!doctype html><meta http-equiv="refresh" content="0; url=box3d_stdb/index.html">
+          EOF
 
       - uses: actions/upload-pages-artifact@v3
         with:

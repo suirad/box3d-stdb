@@ -58,6 +58,13 @@ export const Connected = __t.object("Connected", {
 });
 export type Connected = __Infer<typeof Connected>;
 
+export const EnergyStat = __t.object("EnergyStat", {
+  id: __t.u8(),
+  steps: __t.u64(),
+  awakeSteps: __t.u64(),
+});
+export type EnergyStat = __Infer<typeof EnergyStat>;
+
 export const GameBody = __t.object("GameBody", {
   bodyKey: __t.u64(),
   kind: __t.u8(),

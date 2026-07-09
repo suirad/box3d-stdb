@@ -44,6 +44,7 @@ import TeardownWorldReducer from "./teardown_world_reducer";
 // Import all table schema definitions
 import B3BodyRow from "./b_3_body_table";
 import ConnectedRow from "./connected_table";
+import EnergyStatRow from "./energy_stat_table";
 import GameBodyRow from "./game_body_table";
 import ScoreRow from "./score_table";
 import TuningRow from "./tuning_table";
@@ -77,6 +78,17 @@ const tablesSchema = __schema({
       { name: 'connected_connection_key', constraint: 'unique', columns: ['connection'] },
     ],
   }, ConnectedRow),
+  energy_stat: __table({
+    name: 'energy_stat',
+    indexes: [
+      { accessor: 'id', name: 'energy_stat_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+    ],
+    constraints: [
+      { name: 'energy_stat_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, EnergyStatRow),
   game_body: __table({
     name: 'game_body',
     indexes: [

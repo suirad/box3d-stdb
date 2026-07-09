@@ -59,6 +59,17 @@ pub struct Tuning {
     pub launch_speed: f32,
 }
 
+/// Lifetime workload counters, updated each tick — clients price these into a running TeV total.
+/// Steps and awake-body-steps are the two cost drivers the energy model needs; a table (not
+/// memory) so the total survives restarts and republishes.
+#[spacetimedb::table(accessor = energy_stat, public)]
+pub struct EnergyStat {
+    #[primary_key]
+    pub id: u8,
+    pub steps: u64,
+    pub awake_steps: u64,
+}
+
 #[spacetimedb::table(accessor = pending_despawn)]
 pub struct PendingDespawn {
     #[primary_key]
@@ -267,6 +278,25 @@ pub fn tick(ctx: &ReducerContext, _timer: TickTimer) -> Result<(), String> {
     for m in &res.events.moves {
         if m.position.2 < KILL_Z {
             queue_kill(ctx, m.body_key);
+        }
+    }
+
+    if res.steps_run > 0 {
+        // moves = bodies that moved this tick ≈ the awake count the energy model prices.
+        let awake = res.events.moves.len() as u64;
+        let steps = u64::from(res.steps_run);
+        let mut s = ctx
+            .db
+            .energy_stat()
+            .id()
+            .find(0)
+            .unwrap_or(EnergyStat { id: 0, steps: 0, awake_steps: 0 });
+        s.steps += steps;
+        s.awake_steps += awake * steps;
+        if ctx.db.energy_stat().id().find(0).is_some() {
+            ctx.db.energy_stat().id().update(s);
+        } else {
+            ctx.db.energy_stat().insert(s);
         }
     }
     Ok(())

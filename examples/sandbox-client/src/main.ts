@@ -20,10 +20,7 @@ const WORLD_KEY = 1n;
 // (~7.3k fuel empty, ~20k fuel per awake body, stable from 8 bodies up); asleep bodies are ~4x
 // cheaper (the solver skips them). Each awake body also drives one mirror-row write/tick — priced
 // from the dashboard's write/scan/seek rates (~1.2e-5 TeV), about doubling the per-body cost.
-const SECONDS_PER_MONTH = 2_592_000; // 30 days
-const FREE_TIER_TEV_MO = 2500; // SpacetimeDB free tier allotment
 const TEV_PER_DOLLAR = 2592; // marginal overage rate
-const TICK_HZ = 60;
 const BASE_STEP_TEV = 3.65e-6; // empty step: ~7.3k fuel / 2e9
 const PER_AWAKE_TEV = 2.18e-5; // per awake body/tick: ~20k-fuel compute + one mirror write (dashboard IO)
 
@@ -89,28 +86,20 @@ const meshes = new Map<bigint, THREE.Mesh>();
 const latestPose = new Map<bigint, Pose>();
 
 // ── HUD ───────────────────────────────────────────────────────────────────────
-const MAX_BODIES = 64; // mirrors the module's cap; used for the worst-case "max" figure
 const hud = document.getElementById('hud')!;
-// Split the bar so the cost can be a clickable link that opens the methodology popup.
 const infoSpan = document.createElement('span');
-const costLink = document.createElement('a');
-costLink.href = '#';
-costLink.style.cssText = 'color:#8cf;text-decoration:underline;cursor:pointer;margin-left:8px';
+const costSpan = document.createElement('span');
+costSpan.style.cssText = 'color:#8cf;margin-left:8px';
 hud.textContent = '';
-hud.append(infoSpan, costLink);
+hud.append(infoSpan, costSpan);
 
 let connStatus = 'connecting…';
 let pitCount = 0n;
 let userCount = 0;
 let shootImpulse = 0;
 let launchSpeed = 0;
-let estNowMo = 0;
-let estAvgMo = 0;
-let estMaxMo = 0;
 let awakeCount = 0;
-let estTotalTev = 0;
-let connectedSecs = 0;
-let lastAccrue = performance.now();
+let moduleTev = 0;
 type Mode = 'Spawn' | 'Shoot' | 'Launch';
 let activeMode: Mode = 'Spawn';
 let activeKind = 0; // 0=box, 1=ball
@@ -128,62 +117,15 @@ function refreshHUD() {
   infoSpan.textContent =
     `${connStatus} | users: ${userCount} | pit: ${pitCount} | bodies: ${meshes.size} (${awakeCount} awake)` +
     ` | ${activeMode} ${kind} | forces  shoot ${shootImpulse}  launch ${launchSpeed} |`;
-  costLink.textContent =
-    ` est/mo: now $${estNowMo.toFixed(2)} · avg $${estAvgMo.toFixed(2)} · max $${estMaxMo.toFixed(2)} ⓘ`;
+  const usd = moduleTev / TEV_PER_DOLLAR;
+  costSpan.textContent = ` physics sim cost: ${moduleTev.toPrecision(3)} TeV ($${usd.toPrecision(2)})`;
 }
 refreshHUD();
 
-// Accrue estimated energy over real elapsed time. Ticking only runs while a client is connected,
-// and this one being connected guarantees it — so gate accrual on the connection, not a timer alone.
-const dollarsMo = (tevPerSec: number) => (tevPerSec * SECONDS_PER_MONTH) / TEV_PER_DOLLAR;
 setInterval(() => {
-  const now = performance.now();
-  const dt = (now - lastAccrue) / 1000;
-  lastAccrue = now;
-  const connected = connStatus === 'connected';
-  awakeCount = connected ? awakeBodies() : 0;
-  const nowTevPerSec = connected ? TICK_HZ * (BASE_STEP_TEV + PER_AWAKE_TEV * awakeCount) : 0;
-  if (connected) {
-    estTotalTev += nowTevPerSec * dt;
-    connectedSecs += dt;
-  }
-  estNowMo = dollarsMo(nowTevPerSec);
-  // avg = this session's real usage (bodies sleep → far below the ceiling); max = full arena awake.
-  estAvgMo = connectedSecs > 0 ? dollarsMo(estTotalTev / connectedSecs) : 0;
-  estMaxMo = dollarsMo(TICK_HZ * (BASE_STEP_TEV + PER_AWAKE_TEV * MAX_BODIES));
+  awakeCount = connStatus === 'connected' ? awakeBodies() : 0;
   refreshHUD();
 }, 250);
-
-// ── Cost methodology popup ──────────────────────────────────────────────────────
-const costModal = document.createElement('div');
-costModal.style.cssText =
-  'position:fixed;inset:0;background:rgba(0,0,0,0.7);display:none;align-items:center;' +
-  'justify-content:center;z-index:10;font:13px/1.5 system-ui,sans-serif';
-costModal.innerHTML =
-  `<div style="max-width:560px;background:#1a1a2e;color:#ddd;border:1px solid #445;border-radius:8px;padding:20px 24px">
-    <h3 style="margin:0 0 8px">How this cost is estimated</h3>
-    <p>An <b>estimate</b>, not a bill — SpacetimeDB exposes no live per-reducer energy to a client.
-       The billing rates below were obtained by generating a known workload <b>on Maincloud</b> and
-       reading the energy it actually consumed from the usage dashboard.</p>
-    <ul style="margin:8px 0;padding-left:18px">
-      <li><b>Unit:</b> energy is metered in TeV. Real rate: <b>1 CPU-second = 1 TeV</b>
-          (2×10⁹ WASM instructions), and <b>2,592 TeV = $1</b>.</li>
-      <li><b>Per body:</b> the 60&nbsp;Hz physics tick was measured at ~20,000 instructions per
-          <i>awake</i> body per step (a dedicated no-sleep sweep read off the reducer
-          <code>spacetime-energy-used</code> header). Asleep bodies cost ~4× less — the solver skips
-          them — so cost tracks the awake count, not the total. Each awake body also drives one
-          mirror-row write/tick, priced from the dashboard's write/scan/seek rates.</li>
-      <li><b>now</b> = the current awake bodies, projected to a full month at 60&nbsp;Hz, 24/7.</li>
-      <li><b>avg</b> = this session's <i>actual</i> usage projected out — bodies settle and sleep, so
-          this is the honest typical cost and sits far below the ceiling.</li>
-      <li><b>max</b> = the whole ${MAX_BODIES}-body arena awake 24/7 — the absolute worst case.</li>
-    </ul>
-    <p style="color:#9ab">The compute figure is measured; the per-body write cost is estimated from
-       the dashboard rates. Storage and bandwidth are negligible here. Click anywhere to close.</p>
-  </div>`;
-document.body.appendChild(costModal);
-costLink.addEventListener('click', (e) => { e.preventDefault(); costModal.style.display = 'flex'; });
-costModal.addEventListener('click', () => { costModal.style.display = 'none'; });
 
 // ── Toolbar ───────────────────────────────────────────────────────────────────
 const toolbar = document.querySelector<HTMLElement>('.toolbar-btns')!;
@@ -231,7 +173,7 @@ const conn = DbConnection.builder()
     refreshHUD();
     connection.subscriptionBuilder()
       .onApplied(() => refreshHUD())
-      .subscribe([tables.b3_body, tables.game_body, tables.score, tables.connected, tables.tuning]);
+      .subscribe([tables.b3_body, tables.game_body, tables.score, tables.connected, tables.tuning, tables.energy_stat]);
   })
   .onConnectError((_ctx, err) => {
     connStatus = `error: ${err.message}`;
@@ -296,6 +238,14 @@ conn.db.b3_body.onDelete((_ctx, row) => {
 
 conn.db.score.onInsert((_ctx, row) => { pitCount = row.pitCount; refreshHUD(); });
 conn.db.score.onUpdate((_ctx, _old, row) => { pitCount = row.pitCount; refreshHUD(); });
+
+// Module-lifetime usage: the module accrues steps/awake-steps durably; price them client-side.
+const readEnergy = (row: { steps: bigint; awakeSteps: bigint }) => {
+  moduleTev = Number(row.steps) * BASE_STEP_TEV + Number(row.awakeSteps) * PER_AWAKE_TEV;
+  refreshHUD();
+};
+conn.db.energy_stat.onInsert((_ctx, row) => readEnergy(row));
+conn.db.energy_stat.onUpdate((_ctx, _old, row) => readEnergy(row));
 
 // Live user count = live connection rows. Read the cache count so a resubscribe replay can't drift it.
 const countUsers = () => { userCount = Number(conn.db.connected.count()); refreshHUD(); };
