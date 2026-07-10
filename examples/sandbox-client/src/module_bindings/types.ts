@@ -65,6 +65,15 @@ export const Connected = __t.object("Connected", {
 });
 export type Connected = __Infer<typeof Connected>;
 
+export const DragState = __t.object("DragState", {
+  connection: __t.connectionId(),
+  bodyKey: __t.u64(),
+  tx: __t.f32(),
+  ty: __t.f32(),
+  tz: __t.f32(),
+});
+export type DragState = __Infer<typeof DragState>;
+
 export const EnergyStat = __t.object("EnergyStat", {
   id: __t.u8(),
   steps: __t.u64(),

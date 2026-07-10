@@ -34,6 +34,9 @@ import {
 } from "spacetimedb";
 
 // Import all reducer arg schemas
+import DragEndReducer from "./drag_end_reducer";
+import DragMoveReducer from "./drag_move_reducer";
+import DragStartReducer from "./drag_start_reducer";
 import LaunchReducer from "./launch_reducer";
 import ShootReducer from "./shoot_reducer";
 import SpawnBodyReducer from "./spawn_body_reducer";
@@ -126,6 +129,9 @@ const tablesSchema = __schema({
 
 /** The schema information for all reducers in this module. This is defined the same way as the reducers would have been defined in the server, except the body of the reducer is omitted in code generation. */
 const reducersSchema = __reducers(
+  __reducerSchema("drag_end", DragEndReducer),
+  __reducerSchema("drag_move", DragMoveReducer),
+  __reducerSchema("drag_start", DragStartReducer),
   __reducerSchema("launch", LaunchReducer),
   __reducerSchema("shoot", ShootReducer),
   __reducerSchema("spawn_body", SpawnBodyReducer),

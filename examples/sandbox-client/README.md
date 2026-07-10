@@ -57,8 +57,9 @@ spacetime generate \
 | **Spawn** | click ground plane (click = <5 px / <300 ms) |
 | **Shoot** | click anywhere — fires a ray from camera |
 | **Launch** | click anywhere — spawns a body at camera, fires along ray |
+| **Drag** (default) | press-and-hold a body: mouse slides it horizontally, **Shift** lifts/lowers (sideways still slides); release to let go — the **?** on the button shows this in-app |
 | **Box / Ball** | toggle shape kind before spawning or launching |
-| **Orbit** | click-drag or scroll to rotate/zoom/pan |
+| **Orbit** | right-drag rotate, middle-drag pan, scroll zoom |
 
 Arena reset is an operator action, not a button: `spacetime call box3d-sandbox teardown_world '[]'`.
 

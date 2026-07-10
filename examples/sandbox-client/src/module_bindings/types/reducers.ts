@@ -6,11 +6,17 @@
 import { type Infer as __Infer } from "spacetimedb";
 
 // Import all reducer arg schemas
+import DragEndReducer from "../drag_end_reducer";
+import DragMoveReducer from "../drag_move_reducer";
+import DragStartReducer from "../drag_start_reducer";
 import LaunchReducer from "../launch_reducer";
 import ShootReducer from "../shoot_reducer";
 import SpawnBodyReducer from "../spawn_body_reducer";
 import TeardownWorldReducer from "../teardown_world_reducer";
 
+export type DragEndParams = __Infer<typeof DragEndReducer>;
+export type DragMoveParams = __Infer<typeof DragMoveReducer>;
+export type DragStartParams = __Infer<typeof DragStartReducer>;
 export type LaunchParams = __Infer<typeof LaunchReducer>;
 export type ShootParams = __Infer<typeof ShootReducer>;
 export type SpawnBodyParams = __Infer<typeof SpawnBodyReducer>;

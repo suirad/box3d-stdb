@@ -102,8 +102,8 @@ let shootImpulse = 0;
 let launchSpeed = 0;
 let awakeCount = 0;
 let moduleTev = 0;
-type Mode = 'Spawn' | 'Shoot' | 'Launch';
-let activeMode: Mode = 'Spawn';
+type Mode = 'Spawn' | 'Shoot' | 'Launch' | 'Drag';
+let activeMode: Mode = 'Drag';
 let activeKind = 0; // 0=box, 1=ball
 
 function awakeBodies(): number {
@@ -133,19 +133,51 @@ setInterval(() => {
 const toolbar = document.querySelector<HTMLElement>('.toolbar-btns')!;
 const modeBtns: HTMLButtonElement[] = [];
 
-for (const m of ['Spawn', 'Shoot', 'Launch'] as Mode[]) {
+// Drag mouse-controls popup, opened from the (?) on the Drag button.
+const dragHelp = document.createElement('div');
+dragHelp.style.cssText =
+  'position:fixed;inset:0;background:rgba(0,0,0,0.7);display:none;align-items:center;' +
+  'justify-content:center;z-index:10;font:13px/1.6 system-ui,sans-serif';
+dragHelp.innerHTML =
+  `<div style="background:#1a1a2e;color:#ddd;border:1px solid #445;border-radius:8px;padding:18px 22px">
+    <h3 style="margin:0 0 8px">Drag controls</h3>
+    <table style="border-spacing:0 2px">
+      <tr><td style="color:#8cf;padding-right:12px">hover</td><td>hand cursor over a grabbable body</td></tr>
+      <tr><td style="color:#8cf;padding-right:12px">press + hold</td><td>grab the body under the cursor</td></tr>
+      <tr><td style="color:#8cf;padding-right:12px">move</td><td>slide horizontally at its current height</td></tr>
+      <tr><td style="color:#8cf;padding-right:12px">Shift + move</td><td>lift/lower (up-screen = up), sideways still slides</td></tr>
+      <tr><td style="color:#8cf;padding-right:12px">release</td><td>let go — physics takes over</td></tr>
+    </table>
+    <p style="color:#9ab;margin:10px 0 0">Click anywhere to close.</p>
+  </div>`;
+document.body.appendChild(dragHelp);
+dragHelp.addEventListener('click', () => { dragHelp.style.display = 'none'; });
+
+for (const m of ['Drag', 'Spawn', 'Shoot', 'Launch'] as Mode[]) {
   const btn = document.createElement('button');
   btn.textContent = m;
+  if (m === 'Drag') {
+    const help = document.createElement('sup');
+    help.textContent = ' ?';
+    help.style.cssText = 'color:#8cf;cursor:help';
+    // Open the popup without also switching modes.
+    help.addEventListener('click', (e) => { e.stopPropagation(); dragHelp.style.display = 'flex'; });
+    btn.appendChild(help);
+  }
   btn.addEventListener('click', () => {
+    if (dragging) endDrag();
     activeMode = m;
     modeBtns.forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
+    // Cursor stays default even in Drag mode; the hover raycast switches it to a hand
+    // only over a grabbable body.
+    renderer.domElement.style.cursor = '';
     refreshHUD();
   });
   toolbar.appendChild(btn);
   modeBtns.push(btn);
 }
-modeBtns[0].classList.add('active'); // Spawn is the default mode
+modeBtns[0].classList.add('active'); // Drag is the default mode
 
 const kindBtn = document.createElement('button');
 kindBtn.textContent = 'Box';
@@ -198,6 +230,7 @@ conn.db.game_body.onInsert((_ctx, row) => {
     new THREE.MeshLambertMaterial({ color: row.kind === 0 ? 0x4488ff : 0xff8844 })
   );
   mesh.userData.kind = row.kind;
+  mesh.userData.key = row.bodyKey;
 
   // Apply pose if b3_body arrived first
   const pose = latestPose.get(row.bodyKey);
@@ -268,22 +301,102 @@ const groundPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
 let pdPos = { x: 0, y: 0 };
 let pdTime = 0;
 
+// Drag state: non-null only while a body is being held. `target` is the current commanded
+// point — each move edits only the components its plane owns, so lateral and vertical motion
+// never mix (screen-up is unambiguous: forward by default, lift with Shift).
+let dragging: { key: bigint; target: THREE.Vector3 } | null = null;
+// Throttle dragMove to ~30ms — pointermove fires every frame but the physics
+// module doesn't need sub-frame resolution, and flooding reducers wastes network budget.
+let lastDragMove = 0;
+
+function ndcFromEvent(e: PointerEvent): THREE.Vector2 {
+  return new THREE.Vector2(
+    (e.clientX / innerWidth) * 2 - 1,
+    -(e.clientY / innerHeight) * 2 + 1
+  );
+}
+
+function endDrag() {
+  if (!dragging) return;
+  conn.reducers.dragEnd({});
+  dragging = null;
+  // Default cursor; the hover raycast restores the hand on the next move if still over a body.
+  renderer.domElement.style.cursor = '';
+}
+
 renderer.domElement.addEventListener('pointerdown', (e) => {
   pdPos = { x: e.clientX, y: e.clientY };
   pdTime = Date.now();
+
+  if (e.button !== 0 || activeMode !== 'Drag') return;
+
+  raycaster.setFromCamera(ndcFromEvent(e), camera);
+  const meshList = [...meshes.values()];
+  const hits = raycaster.intersectObjects(meshList, false);
+  if (!hits.length) return;
+
+  const hit = hits[0];
+  const key: bigint = hit.object.userData.key;
+  conn.reducers.dragStart({ bodyKey: key, tx: hit.point.x, ty: hit.point.y, tz: hit.point.z });
+  dragging = { key, target: hit.point.clone() };
+  renderer.domElement.style.cursor = 'grabbing';
+  renderer.domElement.setPointerCapture(e.pointerId);
+});
+
+renderer.domElement.addEventListener('pointermove', (e) => {
+  if (!dragging) {
+    // Hover feedback in Drag mode: hand over a grabbable body, default otherwise.
+    if (activeMode === 'Drag') {
+      raycaster.setFromCamera(ndcFromEvent(e), camera);
+      const over = raycaster.intersectObjects([...meshes.values()], false).length > 0;
+      renderer.domElement.style.cursor = over ? 'grab' : '';
+    }
+    return;
+  }
+  const now = Date.now();
+  // 30 ms gate — skip frames the server wouldn't benefit from
+  if (now - lastDragMove < 30) return;
+  lastDragMove = now;
+
+  raycaster.setFromCamera(ndcFromEvent(e), camera);
+  const t = dragging.target;
+  const pt = new THREE.Vector3();
+  if (e.shiftKey) {
+    // Shift = lift: a vertical plane through the target, facing the camera horizontally.
+    // The plane is exactly vertical, so screen-up maps to pure z (no forward creep) while
+    // sideways motion still slides the body along the camera-right axis.
+    const n = camera.getWorldDirection(new THREE.Vector3());
+    n.z = 0;
+    if (n.lengthSq() < 1e-6) return; // looking straight down: no stable vertical plane
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(n.normalize(), t);
+    if (!raycaster.ray.intersectPlane(plane, pt)) return;
+    t.x = pt.x;
+    t.y = pt.y;
+    t.z = Math.max(pt.z, 0.5);
+  } else {
+    // Default = slide: the horizontal plane at the target's height — screen-up moves the
+    // body away, never upward, so lateral and vertical motion can't blur together.
+    const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), -t.z);
+    if (!raycaster.ray.intersectPlane(plane, pt)) return;
+    t.x = pt.x;
+    t.y = pt.y;
+  }
+  conn.reducers.dragMove({ tx: t.x, ty: t.y, tz: t.z });
 });
 
 renderer.domElement.addEventListener('pointerup', (e) => {
   if (e.button !== 0) return; // left button only — right rotates, middle pans
+
+  // A drag ending must not also fire a click action.
+  // If we were dragging, end the drag and bail before the click path.
+  if (dragging) { endDrag(); return; }
+
   const ddx = e.clientX - pdPos.x;
   const ddy = e.clientY - pdPos.y;
   // Below 5 px / 300 ms is a click; a larger left-drag is ignored, not an action.
   if (ddx * ddx + ddy * ddy > 25 || Date.now() - pdTime >= 300) return;
 
-  const ndc = new THREE.Vector2(
-    (e.clientX / innerWidth) * 2 - 1,
-    -(e.clientY / innerHeight) * 2 + 1
-  );
+  const ndc = ndcFromEvent(e);
   raycaster.setFromCamera(ndc, camera);
 
   if (activeMode === 'Spawn') {
@@ -295,10 +408,12 @@ renderer.domElement.addEventListener('pointerup', (e) => {
     const o = raycaster.ray.origin;
     const d = raycaster.ray.direction;
     conn.reducers.shoot({ ox: o.x, oy: o.y, oz: o.z, dx: d.x, dy: d.y, dz: d.z });
-  } else {
+  } else if (activeMode !== 'Drag') {
     // Launch: spawn at camera position, fire along ray direction
     const o = camera.position;
     const d = raycaster.ray.direction;
     conn.reducers.launch({ kind: activeKind, ox: o.x, oy: o.y, oz: o.z, dx: d.x, dy: d.y, dz: d.z });
   }
 });
+
+renderer.domElement.addEventListener('pointerleave', () => { if (dragging) endDrag(); });
