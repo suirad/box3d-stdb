@@ -31,12 +31,12 @@ crate-type = ["cdylib"]
 [dependencies]
 spacetimedb = "2.6"
 box3d = "0.1.14"
-box3d-stdb = { git = "https://github.com/suirad/box3d-stdb", tag = "v0.1.14-r2" }
+box3d-stdb = { git = "https://github.com/suirad/box3d-stdb", tag = "v0.1.14-r3" }
 
 # Reroute the wrapper's box3d-sys to the wasm-ready build in this repo.
 # Cargo only honors [patch] in the workspace root manifest. Pin the same tag.
 [patch.crates-io]
-box3d-sys = { git = "https://github.com/suirad/box3d-stdb", tag = "v0.1.14-r2" }
+box3d-sys = { git = "https://github.com/suirad/box3d-stdb", tag = "v0.1.14-r3" }
 ```
 
 > **Why git, not crates.io:** the drop-in `box3d-sys` must carry the exact upstream package name

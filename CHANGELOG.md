@@ -5,6 +5,8 @@ they build on (see README maintenance policy).
 
 ## [Unreleased]
 
+## v0.1.14-r3 — 2026-07-09
+
 ### Activity-adaptive ticking (crate-native)
 
 - **BREAKING — `with_world_paced` is now policy-driven:** signature is
