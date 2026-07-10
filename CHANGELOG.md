@@ -5,6 +5,50 @@ they build on (see README maintenance policy).
 
 ## [Unreleased]
 
+### Activity-adaptive ticking (crate-native)
+
+- **BREAKING — `with_world_paced` is now policy-driven:** signature is
+  `with_world_paced(ctx, world_key, rebuild, game)`; dt/substeps/max_catchup live in
+  `WorldDef.tick: TickPolicy`, stored durably at `create_world` (the stored policy is the only
+  source — callers can't diverge, extending the WorldDef contract to time itself).
+  `TickPolicy::realtime(dt, substeps, max_catchup)` is the old behavior exactly and is the
+  default; `TickPolicy::adaptive(tiers, slow_v, k_slow, k_quiet, max_catchup)` runs a tier
+  ladder: demote after `k_slow` consecutive slow steps (fewer substeps, then bigger fixed dt
+  behind the velocity gate that doubles as the tunneling-safety proof), promote to full
+  instantly on any fast mover, and return `TickDirective::Park` once asleep for `k_quiet`
+  steps. Adaptive state (tier/counters/parked) rides the row write the tick already does —
+  zero extra I/O; realtime policies and 0-step firings skip the pass entirely.
+- **BREAKING — `b3_world` schema:** the row gains `tick_policy` (nested type) +
+  `tick_tier`/`slow_ticks`/`quiet_ticks`/`parked`. Existing databases republish with
+  `--delete-data` or migrate by hand (internal table, pre-1.0).
+- `resume_full_rate(ctx, key) -> bool(was_parked)` — snap a world back to full rate at the top
+  of wake-capable reducers; generation-neutral (never invalidates the cache).
+- `set_tick_policy(ctx, key, &TickPolicy)` — replace a live world's policy (e.g. 60 Hz → 30 Hz
+  between rounds); validated, effective next firing, generation-neutral (changes *time*, not
+  *physics* — the cache stays valid). Tier/hysteresis reset to full; `parked` untouched.
+- Hardened after adversarial (Codex) review: policies are validated at `create_world` (an empty
+  tier ladder or sub-µs dt inside the scheduled tick would be a permanent error loop that leaks
+  a poisoned cache per firing); the adaptive speed signal is the per-step max, not each body's
+  final velocity (a fast-then-slow catch-up batch can't fake calm); park additionally requires a
+  moveless batch, so at least one tick always runs after the last event — work your `post` hook
+  queues is never stranded by a same-tick park; the macro's `ensure` replaces timer rows
+  wholesale on unpark (row presence can race a concurrent Park delete — the parked flag is the
+  transactional truth). Closure contract documented: never edit `b3_world`/call
+  `resume_full_rate` inside `rebuild`/`game`.
+- `tick_schedule!` — declarative macro generating the consumer's tick reducer (scheduler-only
+  guard, paced call, `post` hook for events/metering, Park→timer-delete) and an `ensure` helper
+  (resume + re-arm). The scheduled table stays consumer-declared (a proc-macro hygiene limit in
+  spacetimedb 2.6.1 prevents generating it from macro_rules). Viewer connections should
+  arm-only, not `ensure` — resetting hysteresis on every connect would keep a busy lobby from
+  clocking down (the sandbox shows both paths).
+- `WorldCtx::awake_count()` — the live settle signal (`b3World_GetAwakeBodyCount`).
+- Live-measured on the crate engine (10-ball pile): 60.0 steps/s FULL, demote cascade exactly at
+  `k_slow`, 20.0 steps/s sustained CRAWL, two instant promotes under real pile collapses, park
+  with the generated timer-delete, zero cost hands-off. Substep decimation −32% fuel/step at 16
+  awake (346k → 236k measured); bottom tier meters 6× less work than fixed 60 Hz/4-substep.
+  `examples/sandbox-module` shrank ~90 lines by moving onto the crate engine; demo-module uses
+  the macro; 12-assertion leak suite re-verified.
+
 ### Procedure execution mode
 
 - The tick can run inside a SpacetimeDB `#[procedure]` instead of a scheduled reducer — for both

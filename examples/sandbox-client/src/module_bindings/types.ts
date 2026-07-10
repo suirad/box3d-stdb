@@ -44,6 +44,13 @@ export const B3WorldRow = __t.object("B3WorldRow", {
   capStaticBodyCount: __t.i32(),
   capDynamicBodyCount: __t.i32(),
   capContactCount: __t.i32(),
+  get tickPolicy() {
+    return TickPolicy;
+  },
+  tickTier: __t.u8(),
+  slowTicks: __t.u32(),
+  quietTicks: __t.u32(),
+  parked: __t.bool(),
 });
 export type B3WorldRow = __Infer<typeof B3WorldRow>;
 
@@ -61,7 +68,7 @@ export type Connected = __Infer<typeof Connected>;
 export const EnergyStat = __t.object("EnergyStat", {
   id: __t.u8(),
   steps: __t.u64(),
-  awakeSteps: __t.u64(),
+  awakeSubsteps: __t.u64(),
 });
 export type EnergyStat = __Infer<typeof EnergyStat>;
 
@@ -83,11 +90,29 @@ export const Score = __t.object("Score", {
 });
 export type Score = __Infer<typeof Score>;
 
+export const TickPolicy = __t.object("TickPolicy", {
+  get tiers() {
+    return __t.array(Tier);
+  },
+  slowV: __t.f32(),
+  kSlow: __t.u32(),
+  kQuiet: __t.u32(),
+  maxCatchup: __t.u32(),
+});
+export type TickPolicy = __Infer<typeof TickPolicy>;
+
 export const TickTimer = __t.object("TickTimer", {
   scheduledId: __t.u64(),
   scheduledAt: __t.scheduleAt(),
+  worldKey: __t.u64(),
 });
 export type TickTimer = __Infer<typeof TickTimer>;
+
+export const Tier = __t.object("Tier", {
+  dt: __t.f32(),
+  substeps: __t.i32(),
+});
+export type Tier = __Infer<typeof Tier>;
 
 export const Tuning = __t.object("Tuning", {
   id: __t.u8(),

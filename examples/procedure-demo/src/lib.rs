@@ -103,7 +103,7 @@ pub fn tick_proc(ctx: &mut ProcedureContext, timer: TickTimer) -> Result<(), Str
     let wk = timer.world_key;
     ctx.try_with_tx(|tx| {
         // `spawn_scene` is a named fn (no captures) → trivially Fn, safe to pass directly.
-        box3d_stdb::with_world_paced(tx, wk, DT, SUBSTEPS, 4, spawn_scene, |_w| Ok(()))
+        box3d_stdb::with_world_paced(tx, wk, spawn_scene, |_w| Ok(()))
             .map(|_| ())
     })
 }

@@ -21,9 +21,7 @@ use box3d::{BodyDef, ShapeDef, Vec3};
 // Brings the `.b3_body()` accessor into scope for view contexts (their read-only db handle uses
 // a separate generated trait than ReducerContext's); the mirror table lives in box3d-stdb.
 use box3d_stdb::b3_body__view;
-use spacetimedb::{
-    view, AnonymousViewContext, ReducerContext, ScheduleAt, SpacetimeType, Table, TimeDuration,
-};
+use spacetimedb::{view, AnonymousViewContext, ReducerContext, ScheduleAt, SpacetimeType, Table};
 
 const GROUND_KEY: u64 = 1;
 const BALL_KEY: u64 = 2;
@@ -36,6 +34,9 @@ pub fn init(_ctx: &ReducerContext) {
     box3d_stdb::install_box3d_logging();
 }
 
+// ── Scheduled table (consumer-owned; `#[spacetimedb::table]` cannot live inside a macro_rules!)
+// The macro generates the tick reducer and ensure_ticking helper below.
+
 #[spacetimedb::table(accessor = tick_timer, scheduled(tick))]
 pub struct TickTimer {
     #[primary_key]
@@ -45,7 +46,12 @@ pub struct TickTimer {
     pub world_key: u64,
 }
 
-fn spawn_scene(w: &mut box3d_stdb::WorldCtx<'_>) -> Result<(), String> {
+// ── Physics callbacks ─────────────────────────────────────────────────────────
+
+fn spawn_scene(
+    _ctx: &spacetimedb::ReducerContext,
+    w: &mut box3d_stdb::WorldCtx<'_>,
+) -> Result<(), String> {
     let ground = w.spawn(GROUND_KEY, BodyDef::static_at(Vec3::new(0.0, 0.0, -1.0)))?;
     ground.create_box(Vec3::new(50.0, 50.0, 1.0), ShapeDef::default());
     // Fresh world: ball starts at z=5. On rebuild the glue overlays the surviving mirror row
@@ -61,6 +67,33 @@ fn spawn_scene(w: &mut box3d_stdb::WorldCtx<'_>) -> Result<(), String> {
     );
     Ok(())
 }
+
+fn game_logic(
+    _ctx: &spacetimedb::ReducerContext,
+    _w: &mut box3d_stdb::WorldCtx<'_>,
+) -> Result<(), String> {
+    Ok(())
+}
+
+fn post_tick(
+    _ctx: &spacetimedb::ReducerContext,
+    _res: &box3d_stdb::PacedResult<()>,
+) -> Result<(), String> {
+    Ok(())
+}
+
+// Generates: `tick` reducer + `ensure_ticking` arm helper.
+box3d_stdb::tick_schedule! {
+    timer:           tick_timer / TickTimer,
+    reducer:         tick,
+    ensure:          ensure_ticking,
+    interval_micros: 16_667,
+    rebuild:         spawn_scene,
+    game:            game_logic,
+    post:            post_tick,
+}
+
+// ── View ──────────────────────────────────────────────────────────────────────
 
 #[derive(SpacetimeType)]
 pub struct BallHeight {
@@ -83,29 +116,13 @@ fn ball_heights(ctx: &AnonymousViewContext) -> Vec<BallHeight> {
         .collect()
 }
 
+// ── Reducers ──────────────────────────────────────────────────────────────────
+
 /// Create world `world_key` and start ticking it at 60 Hz.
 #[spacetimedb::reducer]
 pub fn create_world(ctx: &ReducerContext, world_key: u64) -> Result<(), String> {
-    if ctx.db.tick_timer().iter().any(|t| t.world_key == world_key) {
-        return Err(format!("world {world_key} already ticking"));
-    }
     box3d_stdb::create_world(ctx, world_key, &box3d_stdb::WorldDef::default())?;
-    ctx.db.tick_timer().insert(TickTimer {
-        scheduled_id: 0,
-        scheduled_at: ScheduleAt::Interval(TimeDuration::from_micros(16_667)),
-        world_key,
-    });
-    Ok(())
-}
-
-/// Scheduled step; wall-clock paced — runs however many fixed-DT steps real time owes (≤4).
-#[spacetimedb::reducer]
-pub fn tick(ctx: &ReducerContext, timer: TickTimer) -> Result<(), String> {
-    if ctx.sender() != ctx.database_identity() {
-        return Err("tick may only be called by the scheduler".into());
-    }
-    box3d_stdb::with_world_paced(ctx, timer.world_key, DT, SUBSTEPS, 4, spawn_scene, |_w| Ok(()))
-        .map(|_| ())
+    ensure_ticking(ctx, world_key)
 }
 
 /// Stop ticking and destroy the world.
@@ -132,7 +149,7 @@ pub fn jump(ctx: &ReducerContext, world_key: u64) -> Result<(), String> {
         world_key,
         DT,
         SUBSTEPS,
-        spawn_scene,
+        |w| spawn_scene(ctx, w),
         |w| {
             let id = w.body_id(BALL_KEY).ok_or("no ball")?;
             let t = id.transform().ok_or("ball body invalid")?;

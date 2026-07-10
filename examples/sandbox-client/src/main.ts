@@ -22,7 +22,9 @@ const WORLD_KEY = 1n;
 // from the dashboard's write/scan/seek rates (~1.2e-5 TeV), about doubling the per-body cost.
 const TEV_PER_DOLLAR = 2592; // marginal overage rate
 const BASE_STEP_TEV = 3.65e-6; // empty step: ~7.3k fuel / 2e9
-const PER_AWAKE_TEV = 2.18e-5; // per awake body/tick: ~20k-fuel compute + one mirror write (dashboard IO)
+// Per awake body per SUBSTEP (the module counts awake×steps×substeps so adaptive tiers price
+// honestly): the ~20k-fuel-per-step compute + mirror write, measured at 4 substeps, ÷4.
+const PER_AWAKE_SUBSTEP_TEV = 2.18e-5 / 4;
 
 // ── Three.js scene ────────────────────────────────────────────────────────────
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -240,8 +242,8 @@ conn.db.score.onInsert((_ctx, row) => { pitCount = row.pitCount; refreshHUD(); }
 conn.db.score.onUpdate((_ctx, _old, row) => { pitCount = row.pitCount; refreshHUD(); });
 
 // Module-lifetime usage: the module accrues steps/awake-steps durably; price them client-side.
-const readEnergy = (row: { steps: bigint; awakeSteps: bigint }) => {
-  moduleTev = Number(row.steps) * BASE_STEP_TEV + Number(row.awakeSteps) * PER_AWAKE_TEV;
+const readEnergy = (row: { steps: bigint; awakeSubsteps: bigint }) => {
+  moduleTev = Number(row.steps) * BASE_STEP_TEV + Number(row.awakeSubsteps) * PER_AWAKE_SUBSTEP_TEV;
   refreshHUD();
 };
 conn.db.energy_stat.onInsert((_ctx, row) => readEnergy(row));

@@ -16,13 +16,14 @@
 //! use box3d::{BodyDef, ShapeDef, Vec3};
 //! use box3d_stdb::{create_world, with_world_paced, WorldDef};
 //!
-//! // Once, e.g. match setup — the definition is stored durably; rebuilds can never diverge.
+//! // Once, e.g. match setup — the definition (physics AND tick policy: dt, substeps,
+//! // catch-up) is stored durably; rebuilds and callers can never diverge from it.
 //! create_world(ctx, ARENA, &WorldDef::default())?;
 //!
 //! // 60 Hz scheduled reducer: reconcile → your logic → step → commit, one transaction.
 //! #[spacetimedb::reducer]
 //! fn tick(ctx: &ReducerContext, t: TickTimer) -> Result<(), String> {
-//!     let res = with_world_paced(ctx, t.world_key, 1.0 / 60.0, 4, /*max_catchup*/ 4,
+//!     let res = with_world_paced(ctx, t.world_key,
 //!         // rebuild: construction only, replayed from YOUR tables after any cache drop
 //!         |w| {
 //!             let ball = w.spawn(BALL, BodyDef::dynamic_at(Vec3::new(0.0, 0.0, 5.0)))?;
@@ -36,6 +37,9 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! The `tick_schedule!` macro generates the scheduled table's reducer + arm helper, so the
+//! boilerplate above collapses to one invocation plus three named fns.
 //!
 //! Body transforms land in the `b3_body` mirror table, delta-committed from move events —
 //! sleeping bodies cost nothing. Expose it through your own `#[view]` (or the `public-mirror`
@@ -67,6 +71,15 @@
 //! determinism, 0.3% sim-vs-wall deviation measured, and overload degrades to the maximum
 //! sustainable rate then self-recovers instead of death-spiraling.
 //!
+//! # Pay for activity, not for existing
+//!
+//! An adaptive [`TickPolicy`] clocks slow scenes down a tier ladder (fewer substeps, then bigger
+//! fixed `dt` behind a velocity gate that doubles as the tunneling-safety proof) and, once fully
+//! asleep, returns [`TickDirective::Park`] — stop the timer, the world costs zero until a
+//! mutation wakes it ([`resume_full_rate`] + re-arm, both wrapped by `tick_schedule!`'s `ensure`
+//! helper). Measured: 20 steps/s at the bottom tier vs 60 at full, 6× less metered work on a
+//! slow-creeping pile, instant promotion on fast movers.
+//!
 //! # Ephemeral worlds
 //!
 //! ```ignore
@@ -82,7 +95,7 @@
 //! `TxContext` derefs to `ReducerContext`, so the same API runs inside a `#[procedure]`:
 //!
 //! ```ignore
-//! ctx.try_with_tx(|tx| with_world_paced(tx, wk, DT, 4, 4, rebuild, game).map(|_| ()))
+//! ctx.try_with_tx(|tx| with_world_paced(tx, wk, rebuild, game).map(|_| ()))
 //! ```
 //!
 //! `try_with_tx`, not `with_tx`: a guard `Err` must abort the transaction, never commit.
@@ -130,6 +143,8 @@ mod world;
 // Glob is deliberate: consumer `#[view]`s need the row types and the
 // macro-generated accessor traits, whose names aren't stable API to enumerate.
 pub use world::*;
+
+mod tick_macro;
 
 // Load-bearing for the cdylib link gate: keeps box3d-sys's #[no_mangle]
 // exports (box3d_smoke + allocator/libm symbols) in this crate's call graph.

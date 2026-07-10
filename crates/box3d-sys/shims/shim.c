@@ -38,7 +38,6 @@ int strcmp(const char* a, const char* b)
 
 // --- stdlib ---
 
-// ponytail: shellsort, O(n^1.3)-ish and deterministic; swap for a real
 // introsort if a profile ever blames it.
 void qsort(void* base, size_t nmemb, size_t size, int (*cmp)(const void*, const void*))
 {

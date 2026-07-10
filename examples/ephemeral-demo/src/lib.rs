@@ -87,9 +87,7 @@ pub fn tick(ctx: &ReducerContext, timer: TickTimer) -> Result<(), String> {
     if ctx.sender() != ctx.database_identity() {
         return Err("tick may only be called by the scheduler".into());
     }
-    let res = box3d_stdb::with_world_paced(
-        ctx, timer.world_key, DT, SUBSTEPS, 4, spawn_scene, |_w| Ok(()),
-    )?;
+    let res = box3d_stdb::with_world_paced(ctx, timer.world_key, spawn_scene, |_w| Ok(()))?;
     let tick = ctx.db.b3_world().world_key().find(timer.world_key).map_or(0, |w| w.tick);
     for m in &res.events.moves {
         ctx.db.ball_pos().insert(BallPos {

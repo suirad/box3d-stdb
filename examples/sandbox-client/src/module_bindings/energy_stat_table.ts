@@ -13,5 +13,5 @@ import {
 export default __t.row({
   id: __t.u8().primaryKey(),
   steps: __t.u64(),
-  awakeSteps: __t.u64().name("awake_steps"),
+  awakeSubsteps: __t.u64().name("awake_substeps"),
 });

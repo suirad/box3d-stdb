@@ -317,7 +317,7 @@ pub fn bench_tick(ctx: &ReducerContext, timer: BenchTimer) -> Result<(), String>
     if ctx.sender() != ctx.database_identity() {
         return Err("bench_tick may only be called by the scheduler".into());
     }
-    box3d_stdb::with_world_paced(ctx, timer.world_key, DT, SUBSTEPS, 4,
+    box3d_stdb::with_world_paced(ctx, timer.world_key,
         |w| spawn_scene_bench(w, timer.world_key, timer.n), |_| Ok(()))
     .map(|_| ())
 }
