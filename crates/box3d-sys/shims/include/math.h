@@ -21,6 +21,15 @@ float logf(float);
 float fminf(float, float);
 float fmaxf(float, float);
 
+// The wasm-sse2 compat headers (emscripten's SSE2->wasm128 shims) call these
+// double/rounding libm functions. All lower to native wasm ops (f64.abs,
+// f64.nearest + trunc conversions) — no libcall, no Rust-side export needed.
+static __inline__ double fabs(double __x) { return __builtin_fabs(__x); }
+static __inline__ long lrint(double __x) { return (long)__builtin_rint(__x); }
+static __inline__ long lrintf(float __x) { return (long)__builtin_rintf(__x); }
+static __inline__ long long llrint(double __x) { return (long long)__builtin_rint(__x); }
+static __inline__ long long llrintf(float __x) { return (long long)__builtin_rintf(__x); }
+
 #define isinf(x) __builtin_isinf(x)
 #define isnan(x) __builtin_isnan(x)
 #define isfinite(x) __builtin_isfinite(x)
